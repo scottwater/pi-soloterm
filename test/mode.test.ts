@@ -21,13 +21,16 @@ test("tool activation adds and removes SoloTerm tools", () => {
 	assert.deepEqual(applySoloTermToolActivation(enabled, false), ["read"]);
 });
 
-test("restoreSoloTermState treats --soloterm as enabling SoloTerm", () => {
+test("restoreSoloTermState enables SoloTerm by default and treats --soloterm as explicit enable", () => {
+	assert.deepEqual(restoreSoloTermState([], false), { active: true, source: "restore" });
 	assert.deepEqual(restoreSoloTermState([], true), { active: true, source: "flag" });
 });
 
 test("restoreSoloTermState reads persisted state", () => {
-	const entry = { type: "custom", customType: "soloterm-state", data: makeSoloTermStateEntry(true, "command") };
-	assert.deepEqual(restoreSoloTermState([entry], false), { active: true, source: "restore" });
+	const enabled = { type: "custom", customType: "soloterm-state", data: makeSoloTermStateEntry(true, "command") };
+	const disabled = { type: "custom", customType: "soloterm-state", data: makeSoloTermStateEntry(false, "command") };
+	assert.deepEqual(restoreSoloTermState([enabled], false), { active: true, source: "restore" });
+	assert.deepEqual(restoreSoloTermState([disabled], false), { active: false, source: "restore" });
 });
 
 test("status label shows only SoloTerm state", () => {

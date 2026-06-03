@@ -55,6 +55,7 @@ export function normalizeStateData(value: unknown): SoloTermStateData | null {
 export function restoreSoloTermState(
 	entries: readonly unknown[],
 	flagActive: boolean,
+	defaultActive = true,
 ): { active: boolean; source: SoloTermStateData["source"] } {
 	if (flagActive) return { active: true, source: "flag" };
 
@@ -65,7 +66,7 @@ export function restoreSoloTermState(
 		if (state) return { active: state.active, source: "restore" };
 	}
 
-	return { active: false, source: "restore" };
+	return { active: defaultActive, source: "restore" };
 }
 
 export function withSoloTermTools(activeTools: readonly string[]): string[] {

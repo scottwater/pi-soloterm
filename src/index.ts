@@ -21,10 +21,10 @@ interface RuntimeState {
 }
 
 export default function solotermExtension(pi: ExtensionAPI): void {
-	const runtime: RuntimeState = { active: false, source: "restore" };
+	const runtime: RuntimeState = { active: true, source: "restore" };
 
 	pi.registerFlag("soloterm", {
-		description: "Enable SoloTerm mode: Solo MCP-backed status, subagents, todos, and scratchpads.",
+		description: "Ensure SoloTerm mode is enabled. Installed pi-soloterm sessions enable SoloTerm tools by default.",
 		type: "boolean",
 		default: false,
 	});

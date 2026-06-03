@@ -7,18 +7,16 @@ This package is intentionally generic. It does not know about, load, or configur
 ## Install
 
 ```bash
-pi install ~/projects/pi-soloterm
+pi install https://github.com/scottwater/pi-soloterm
 ```
 
 For live child-agent testing, install it with `pi install`; `pi -e` only affects the current parent process.
 
-## Enable SoloTerm tools
+## SoloTerm tools are enabled when installed
 
-```bash
-pi --soloterm
-```
+Once the package is installed, new Pi sessions expose the SoloTerm tools automatically. You do not need to pass `--soloterm` just to use them.
 
-Or inside Pi:
+`--soloterm` is still accepted as an explicit enable/compatibility flag, and `/soloterm` can be used inside Pi:
 
 ```text
 /soloterm on
