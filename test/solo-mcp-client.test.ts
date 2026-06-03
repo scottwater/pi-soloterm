@@ -1,0 +1,108 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
+import test from "node:test";
+import {
+	parseJsonRpcLine,
+	SoloMcpClient,
+	type JsonRpcRequest,
+	type McpToolCallResult,
+	soloToolResultIsError,
+	mcpContentToText,
+} from "../src/solo-mcp-client.ts";
+
+class FakeSoloHelper extends EventEmitter {
+	stdout = new PassThrough();
+	stderr = new PassThrough();
+	stdin: Writable;
+	requests: JsonRpcRequest[] = [];
+	killed = false;
+	private handlers: Record<string, (params: unknown) => unknown>;
+
+	constructor(handlers: Record<string, (params: unknown) => unknown>) {
+		super();
+		this.handlers = handlers;
+		this.stdin = new Writable({
+			write: (chunk, _encoding, callback) => {
+				for (const line of String(chunk).split("\n")) {
+					if (!line.trim()) continue;
+					const request = JSON.parse(line) as JsonRpcRequest;
+					if (typeof request.id !== "number") continue;
+					this.requests.push(request);
+					try {
+						const result = this.handlers[request.method]?.(request.params) ?? {};
+						this.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
+					} catch (error) {
+						this.stdout.write(
+							`${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } })}\n`,
+						);
+					}
+				}
+				callback();
+			},
+		});
+	}
+
+	kill(): boolean {
+		this.killed = true;
+		this.emit("exit", 0, null);
+		return true;
+	}
+}
+
+test("parseJsonRpcLine parses responses and ignores invalid lines", () => {
+	assert.equal(parseJsonRpcLine("not json"), undefined);
+	assert.equal(parseJsonRpcLine(JSON.stringify({ jsonrpc: "1.0", id: 1, result: {} })), undefined);
+	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", method: "note" })), { jsonrpc: "2.0", method: "note" });
+	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { ok: true } })), { jsonrpc: "2.0", id: 7, result: { ok: true } });
+	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", id: 8, error: { code: -1, message: "bad" } })), { jsonrpc: "2.0", id: 8, error: { code: -1, message: "bad" } });
+});
+
+test("SoloMcpClient handshakes, lists catalog, and calls tools with fake helper", async () => {
+	let helper!: FakeSoloHelper;
+	const handlers = {
+		initialize: () => ({ protocolVersion: "2024-11-05", serverInfo: { name: "fake-solo", version: "1" } }),
+		"tools/list": () => ({ tools: [{ name: "identify_session" }, { name: "echo" }] }),
+		"tools/call": (params: any): McpToolCallResult => {
+			if (params.name === "identify_session") return { structuredContent: { process_id: 123, project: { name: "demo" } } };
+			if (params.name === "echo") return { content: [{ type: "text", text: JSON.stringify({ echoed: params.arguments }) }] };
+			return { isError: true, content: [{ type: "text", text: "missing" }] };
+		},
+	};
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		spawn: () => {
+			helper = new FakeSoloHelper(handlers);
+			return helper as any;
+		},
+	});
+
+	await client.start();
+	assert.equal(client.state, "ready");
+	assert.equal(client.hasTool("echo"), true);
+	assert.equal(client.identity?.process_id, 123);
+
+	const result = await client.callTool("echo", { hello: "world" });
+	assert.equal(mcpContentToText(result), JSON.stringify({ echoed: { hello: "world" } }));
+	assert.equal(helper.requests.some((request) => request.method === "initialize"), true);
+	assert.equal(helper.requests.some((request) => request.method === "tools/list"), true);
+	assert.equal(helper.requests.some((request) => request.method === "tools/call"), true);
+
+	client.stop();
+	assert.equal(helper.killed, true);
+});
+
+test("tool-call error detection catches MCP isError and Solo failure text", () => {
+	assert.equal(soloToolResultIsError({ isError: true, content: [] }), true);
+	assert.equal(soloToolResultIsError({ content: [{ type: "text", text: "Solo tool call failed: nope" }] }), true);
+	assert.equal(soloToolResultIsError({ content: [{ type: "text", text: "ok" }] }), false);
+});
+
+test("SoloMcpClient reports missing helper as failed state", async () => {
+	const client = new SoloMcpClient({ helperPath: "/missing", exists: () => false });
+	await client.start();
+	assert.equal(client.state, "failed");
+	assert.match(client.lastError ?? "", /helper not found/);
+});
