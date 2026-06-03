@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { defaultTaskName, runSoloTask, summarizeSoloTask, type SoloTaskSpec } from "./solo-subagents.ts";
+import { defaultTaskName, runSoloTask, summarizeSoloTask, type SoloTaskSpec, type SpawnedSoloTask } from "./solo-subagents.ts";
 import type { SoloCallToolLike } from "./solo-mcp-client.ts";
 
 const SingleTaskParams = Type.Object({
@@ -96,6 +97,24 @@ function unavailable(text: string) {
 	};
 }
 
+async function runTaskSafely(client: SoloCallToolLike, spec: SoloTaskSpec): Promise<SpawnedSoloTask> {
+	try {
+		return await runSoloTask(client, spec);
+	} catch (error) {
+		return {
+			id: randomUUID(),
+			name: spec.name,
+			processId: 0,
+			status: "failed",
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+function taskSucceeded(result: SpawnedSoloTask): boolean {
+	return result.status === "completed" || result.status === "started";
+}
+
 export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDeps): void {
 	pi.registerTool({
 		name: "solo_task",
@@ -119,8 +138,8 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 			const piFlags = deps.getChildPiFlags?.() ?? ["--soloterm"];
 			try {
 				if (tasks) {
-					const results = await mapWithConcurrency(tasks, params.concurrency ?? 4, async (task) => runSoloTask(deps.client, normalizeSingleTask(task, piFlags)));
-					const succeeded = results.filter((result) => result.status === "completed").length;
+					const results = await mapWithConcurrency(tasks, params.concurrency ?? 4, async (task) => runTaskSafely(deps.client, normalizeSingleTask(task, piFlags)));
+					const succeeded = results.filter(taskSucceeded).length;
 					return {
 						content: [
 							{
@@ -137,11 +156,11 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 					return unavailable("solo_task requires either a single task string or a non-empty tasks array.");
 				}
 
-				const result = await runSoloTask(deps.client, normalizeSingleTask(params as SingleTaskArgs, piFlags));
+				const result = await runTaskSafely(deps.client, normalizeSingleTask(params as SingleTaskArgs, piFlags));
 				return {
 					content: [{ type: "text" as const, text: summarizeSoloTask(result) }],
 					details: { mode: "single", result },
-					isError: result.status !== "completed" && result.status !== "started",
+					isError: !taskSucceeded(result),
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);

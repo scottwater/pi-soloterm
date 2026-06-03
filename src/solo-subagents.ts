@@ -25,7 +25,8 @@ export interface SpawnedSoloTask {
 	artifactScratchpadName?: string;
 	output?: string;
 	artifactContent?: string;
-	status: "completed" | "timeout" | "started";
+	status: "completed" | "timeout" | "started" | "failed" | "no_output";
+	error?: string;
 }
 
 export interface SoloTaskSpec {
@@ -178,7 +179,12 @@ async function waitForReady(client: SoloCallToolLike, processId: number, timeout
 		try {
 			const result = await client.callTool("get_process_status", { process_id: processId });
 			const data = extractStructuredOrTextJson<any>(result);
-			if (data?.agent_state?.idle === true || data?.status === "running") return;
+			if (data?.agent_state?.idle === true) return;
+			if (data?.status === "running") {
+				// A process can report running before its PTY is ready to receive input.
+				await delay(500);
+				return;
+			}
 		} catch {
 			// Keep waiting for a freshly spawned process.
 		}
@@ -210,12 +216,18 @@ async function waitForIdle(
 	return "timeout";
 }
 
+function normalizeCapturedOutput(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed === '""') return undefined;
+	return value;
+}
+
 async function readProcessOutput(client: SoloCallToolLike, processId: number): Promise<string | undefined> {
 	if (!client.hasTool("get_process_output")) return undefined;
 	try {
 		const result = await client.callTool("get_process_output", { process_id: processId, lines: 200 });
 		if (soloToolResultIsError(result)) return undefined;
-		return mcpContentToText(result) || JSON.stringify(extractStructuredOrTextJson(result) ?? "", null, 2);
+		return normalizeCapturedOutput(mcpContentToText(result) || JSON.stringify(extractStructuredOrTextJson(result) ?? "", null, 2));
 	} catch {
 		return undefined;
 	}
@@ -253,6 +265,22 @@ async function closeProcess(client: SoloCallToolLike, processId: number): Promis
 	}
 }
 
+async function sendInputWithRetry(client: SoloCallToolLike, processId: number, prompt: string): Promise<void> {
+	let lastError = "unknown send_input error";
+	for (let attempt = 0; attempt < 4; attempt++) {
+		if (attempt > 0) await delay(750 * attempt);
+		try {
+			const result = await client.callTool("send_input", { process_id: processId, input: prompt, submit: true });
+			if (!soloToolResultIsError(result)) return;
+			lastError = errorText(result);
+		} catch (error) {
+			lastError = error instanceof Error ? error.message : String(error);
+		}
+		if (!/pty|input\/output|not ready|busy|starting/i.test(lastError)) break;
+	}
+	throw new Error(`send_input failed: ${lastError}`);
+}
+
 export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec): Promise<SpawnedSoloTask> {
 	for (const required of ["list_agent_tools", "send_input", "get_process_status"]) {
 		if (!client.hasTool(required)) throw new Error(`Solo MCP tool '${required}' is required for solo_task.`);
@@ -275,13 +303,13 @@ export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec):
 
 	await waitForReady(client, processId);
 	const prompt = buildSoloTaskPrompt(spec, artifact);
-	const sendResult = await client.callTool("send_input", { process_id: processId, input: prompt, submit: true });
-	if (soloToolResultIsError(sendResult)) throw new Error(`send_input failed: ${errorText(sendResult)}`);
+	await sendInputWithRetry(client, processId, prompt);
 
 	const shouldWait = spec.wait !== false;
-	const status = shouldWait ? await waitForIdle(client, processId, spec.maxWaitMs ?? 30 * 60_000) : "started";
+	let status: SpawnedSoloTask["status"] = shouldWait ? await waitForIdle(client, processId, spec.maxWaitMs ?? 30 * 60_000) : "started";
 	const output = shouldWait ? await readProcessOutput(client, processId) : undefined;
 	const artifactContent = shouldWait ? await readScratchpadArtifact(client, artifact) : undefined;
+	if (shouldWait && status === "completed" && !output && !artifactContent) status = "no_output";
 	if (shouldWait && spec.closeOnComplete === true) await closeProcess(client, processId);
 
 	return {
@@ -297,11 +325,12 @@ export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec):
 }
 
 export function summarizeSoloTask(result: SpawnedSoloTask): string {
-	const title = `### ${result.name} (${result.status}, Solo #${result.processId})`;
+	const process = result.processId > 0 ? `Solo #${result.processId}` : "not spawned";
+	const title = `### ${result.name} (${result.status}, ${process})`;
 	const artifact = result.artifactScratchpadName
 		? `\nArtifact: ${result.artifactScratchpadName}${result.artifactScratchpadId != null ? ` (#${result.artifactScratchpadId})` : ""}`
 		: "";
-	const body = result.artifactContent || result.output || "(no output captured)";
+	const body = result.error ? `Error: ${result.error}` : result.artifactContent || result.output || "(no output captured)";
 	return `${title}${artifact}\n\n${body}`;
 }
 

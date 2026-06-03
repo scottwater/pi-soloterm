@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import type { SoloMcpClient } from "./solo-mcp-client.ts";
+import { extractStructuredOrTextJson, soloToolResultIsError, type SoloMcpClient } from "./solo-mcp-client.ts";
 
 const SoloStatusParams = Type.Object({
 	refresh: Type.Optional(Type.Boolean({ description: "Reconnect/refresh Solo MCP tool metadata before reporting status. Defaults to true." })),
@@ -26,7 +26,29 @@ function missing(client: SoloMcpClient, tools: readonly string[]): string[] {
 	return tools.filter((tool) => !client.hasTool(tool));
 }
 
-export function renderSoloStatus(deps: SoloStatusDeps): string {
+async function listAgentTools(client: SoloMcpClient): Promise<string | undefined> {
+	if (!client.hasTool("list_agent_tools")) return undefined;
+	try {
+		const result = await client.callTool("list_agent_tools", {});
+		if (soloToolResultIsError(result)) return undefined;
+		const data = extractStructuredOrTextJson<any>(result);
+		const tools = Array.isArray(data?.tools) ? data.tools : Array.isArray(data) ? data : [];
+		const enabled = tools.filter((tool: any) => tool?.enabled !== false).slice(0, 12);
+		if (!enabled.length) return undefined;
+		return enabled
+			.map((tool: any) => {
+				const id = tool?.id != null ? `#${tool.id}` : "#?";
+				const name = String(tool?.name ?? "unnamed");
+				const command = String(tool?.command ?? "").trim();
+				return command ? `${id} ${name} (${command})` : `${id} ${name}`;
+			})
+			.join(", ");
+	} catch {
+		return undefined;
+	}
+}
+
+export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string): string {
 	const client = deps.client;
 	const taskMissing = missing(client, TASK_TOOLS);
 	const scratchpadMissing = missing(client, SCRATCHPAD_TOOLS);
@@ -54,6 +76,7 @@ export function renderSoloStatus(deps: SoloStatusDeps): string {
 		`- Subagent support: ${taskMissing.length ? `missing ${taskMissing.join(", ")}` : "available"}`,
 		`- Scratchpad support: ${scratchpadMissing.length ? `missing ${scratchpadMissing.join(", ")}` : "available"}`,
 		`- Todo support: ${todoMissing.length ? `missing ${todoMissing.join(", ")} (Pi fallback is used by solo_todo)` : "available"}`,
+		agentTools ? `- Enabled agent tools: ${agentTools}` : undefined,
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -79,7 +102,8 @@ export function registerSoloStatusTool(pi: ExtensionAPI, deps: SoloStatusDeps): 
 			} catch {
 				// renderSoloStatus includes the client's failed state and lastError.
 			}
-			return { content: [{ type: "text" as const, text: renderSoloStatus(deps) }] };
+			const agentTools = await listAgentTools(deps.client);
+			return { content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools) }] };
 		},
 		renderCall(_args: Record<string, any>, theme: any) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);
