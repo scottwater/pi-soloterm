@@ -9,6 +9,7 @@ import {
 } from "./mode.ts";
 import { buildSoloTermSystemPrompt } from "./resources.ts";
 import { SoloMcpClient } from "./solo-mcp-client.ts";
+import { BUNDLED_SOLO_SKILL_PATH, hasSoloSkill } from "./solo-skill.ts";
 import { registerSoloTermScratchpadTool } from "./solo-scratchpad-tool.ts";
 import { registerSoloStatusTool } from "./solo-status-tool.ts";
 import { registerSoloTermTaskTool } from "./solo-task-tool.ts";
@@ -45,6 +46,11 @@ export default function solotermExtension(pi: ExtensionAPI): void {
 	registerSoloTermTaskTool(pi, { client, isActive, isClientReady, getChildPiFlags: () => ["--soloterm"] });
 	registerSoloTermTodoTool(pi, { client, isActive, isClientReady });
 	registerSoloTermScratchpadTool(pi, { client, isActive, isClientReady });
+
+	pi.on("resources_discover", () => {
+		if (hasSoloSkill(pi.getCommands())) return {};
+		return { skillPaths: [BUNDLED_SOLO_SKILL_PATH] };
+	});
 
 	function updateStatus(ctx: ExtensionContext | undefined): void {
 		if (!ctx?.hasUI) return;

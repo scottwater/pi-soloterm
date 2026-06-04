@@ -2,7 +2,7 @@
 
 Optional Pi extension that exposes SoloTerm MCP features as native Pi tools.
 
-This package is intentionally generic. It does not know about, load, or configure any skill bundle. Its job is only to let Pi use SoloTerm's MCP server for status, child agent processes, todos, and scratchpads.
+The extension also provides a bundled `solo` skill as a fallback. If Pi already has a `solo` skill available, this package leaves it alone; otherwise it contributes its bundled skill during resource discovery so agents know to use the SoloTerm bridge.
 
 ## Install
 
@@ -12,9 +12,11 @@ pi install https://github.com/scottwater/pi-soloterm
 
 For live child-agent testing, install it with `pi install`; `pi -e` only affects the current parent process.
 
-## SoloTerm tools are enabled when installed
+## SoloTerm tools and skill are enabled when installed
 
 Once the package is installed, new Pi sessions expose the SoloTerm tools automatically. You do not need to pass `--soloterm` just to use them.
+
+If Pi does not already have a `solo` skill, the extension adds its bundled fallback skill automatically. Existing user or project `solo` skills take precedence.
 
 `--soloterm` is still accepted as an explicit enable/compatibility flag, and `/soloterm` can be used inside Pi:
 
