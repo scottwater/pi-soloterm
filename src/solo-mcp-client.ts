@@ -114,6 +114,7 @@ export interface SoloCallToolLike {
 	callTool(name: string, args?: unknown): Promise<McpToolCallResult>;
 	hasTool(name: string): boolean;
 	tools: McpToolDef[];
+	identity?: SoloIdentity;
 }
 
 export function parseJsonRpcLine(line: string): JsonRpcMessage | undefined {

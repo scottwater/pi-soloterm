@@ -15,8 +15,9 @@ export interface SoloStatusDeps {
 }
 
 const TASK_TOOLS = ["list_agent_tools", "spawn_agent", "send_input", "get_process_status"];
+const PROCESS_TOOLS = ["list_processes", "get_process_status", "get_process_output", "close_process"];
 const SCRATCHPAD_TOOLS = ["scratchpad_list", "scratchpad_read", "scratchpad_write"];
-const TODO_TOOLS = ["todo_read", "todo_write"];
+const TODO_TOOLS = ["todo_create", "todo_list", "todo_update", "todo_complete"];
 
 function yesNo(value: boolean): string {
 	return value ? "yes" : "no";
@@ -51,6 +52,7 @@ async function listAgentTools(client: SoloMcpClient): Promise<string | undefined
 export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string): string {
 	const client = deps.client;
 	const taskMissing = missing(client, TASK_TOOLS);
+	const processMissing = missing(client, PROCESS_TOOLS);
 	const scratchpadMissing = missing(client, SCRATCHPAD_TOOLS);
 	const todoMissing = missing(client, TODO_TOOLS);
 	const project = client.identity?.project;
@@ -74,6 +76,7 @@ export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string): str
 		`- Session identity: ${identity}`,
 		client.lastError ? `- Last error: ${client.lastError}` : undefined,
 		`- Subagent support: ${taskMissing.length ? `missing ${taskMissing.join(", ")}` : "available"}`,
+		`- Process support: ${processMissing.length ? `missing ${processMissing.join(", ")}` : "available"}`,
 		`- Scratchpad support: ${scratchpadMissing.length ? `missing ${scratchpadMissing.join(", ")}` : "available"}`,
 		`- Todo support: ${todoMissing.length ? `missing ${todoMissing.join(", ")} (Pi fallback is used by solo_todo)` : "available"}`,
 		agentTools ? `- Enabled agent tools: ${agentTools}` : undefined,

@@ -17,7 +17,7 @@ test("parseSoloTermCommand supports common actions", () => {
 
 test("tool activation adds and removes SoloTerm tools", () => {
 	const enabled = applySoloTermToolActivation(["read"], true);
-	assert.deepEqual(enabled, ["read", "solo_status", "solo_task", "solo_todo", "solo_scratchpad"]);
+	assert.deepEqual(enabled, ["read", "solo_status", "solo_task", "solo_process", "solo_todo", "solo_scratchpad"]);
 	assert.deepEqual(applySoloTermToolActivation(enabled, false), ["read"]);
 });
 

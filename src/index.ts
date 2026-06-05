@@ -10,6 +10,7 @@ import {
 import { buildSoloTermSystemPrompt } from "./resources.ts";
 import { SoloMcpClient } from "./solo-mcp-client.ts";
 import { BUNDLED_SOLO_SKILL_PATH, hasSoloSkill } from "./solo-skill.ts";
+import { registerSoloTermProcessTool } from "./solo-process-tool.ts";
 import { registerSoloTermScratchpadTool } from "./solo-scratchpad-tool.ts";
 import { registerSoloStatusTool } from "./solo-status-tool.ts";
 import { registerSoloTermTaskTool } from "./solo-task-tool.ts";
@@ -44,6 +45,7 @@ export default function solotermExtension(pi: ExtensionAPI): void {
 
 	registerSoloStatusTool(pi, { client, isActive });
 	registerSoloTermTaskTool(pi, { client, isActive, isClientReady, getChildPiFlags: () => ["--soloterm"] });
+	registerSoloTermProcessTool(pi, { client, isActive, isClientReady });
 	registerSoloTermTodoTool(pi, { client, isActive, isClientReady });
 	registerSoloTermScratchpadTool(pi, { client, isActive, isClientReady });
 

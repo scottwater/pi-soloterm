@@ -15,6 +15,7 @@ If running under Pi, detected by `PI_CODING_AGENT=true`, use the `pi-soloterm` e
 
 - `solo_status` — verify SoloTerm/MCP availability, identity, and feature support.
 - `solo_task` — spawn Solo-managed coding agents/processes and send them prompts.
+- `solo_process` — list, inspect, read output from, or close existing Solo-managed processes. Use `action=close_subagents` to clean up Pi-spawned `--soloterm` child-agent panes.
 - `solo_scratchpad` — list, read, or write Solo scratchpads.
 - `solo_todo` — manage Solo todos when available, with Pi session fallback.
 

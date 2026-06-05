@@ -1,6 +1,6 @@
 export const SOLOTERM_STATE_ENTRY = "soloterm-state";
 
-export const SOLOTERM_TOOL_NAMES = ["solo_status", "solo_task", "solo_todo", "solo_scratchpad"] as const;
+export const SOLOTERM_TOOL_NAMES = ["solo_status", "solo_task", "solo_process", "solo_todo", "solo_scratchpad"] as const;
 
 export type SoloTermToolName = (typeof SOLOTERM_TOOL_NAMES)[number];
 

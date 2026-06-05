@@ -32,6 +32,7 @@ When active, the footer/status line shows `◫ soloterm`.
 
 - `solo_status` — verifies SoloTerm/Pi mode, Solo MCP state, session identity, and feature support.
 - `solo_task` — spawns Solo agent panes through Solo MCP, sends prompts, waits for idle output, and optionally uses scratchpad artifacts.
+- `solo_process` — lists, inspects, reads output from, and closes Solo-managed processes. Use `action: "close_subagents"` to safely close Pi-spawned `--soloterm` child-agent panes in the current/effective project.
 - `solo_todo` — mirrors task lists to Solo todos when available and keeps a Pi fallback.
 - `solo_scratchpad` — lists, reads, and writes Solo scratchpads.
 
