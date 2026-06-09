@@ -2,6 +2,7 @@
 
 ## 0.1.1 - 2026-06-09
 
+- Rename the npm package to `pi-solo-term-tools` for the first public publish.
 - Update Solo task guardrails so `model: "pi"` fails with a clear message instead of passing `--model pi` to a child Pi process. Use `agentTool: "pi"` to choose the Pi agent.
 - Add Solo process management for listing, reading, and closing Pi-spawned subagent panes from Pi.
 - Add fallback Solo skill discovery so Pi sessions expose Solo guidance when no other Solo skill is installed.
