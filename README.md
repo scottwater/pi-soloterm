@@ -1,4 +1,6 @@
-# pi-soloterm
+![Repository social preview](assets/github-social-preview.png)
+
+# pi-soloterm-tools
 
 Optional Pi extension that exposes SoloTerm MCP features as native Pi tools.
 
@@ -7,7 +9,7 @@ The extension also provides a bundled `solo` skill as a fallback. If Pi already 
 ## Install
 
 ```bash
-pi install https://github.com/scottwater/pi-soloterm
+pi install https://github.com/scottwater/pi-soloterm-tools
 ```
 
 For live child-agent testing, install it with `pi install`; `pi -e` only affects the current parent process.
