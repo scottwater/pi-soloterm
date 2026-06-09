@@ -143,8 +143,12 @@ export async function resolveSoloAgentToolId(client: SoloCallToolLike, requested
 
 export function buildPiExtraArgs(spec: SoloTaskSpec, isPiAgent: boolean): string[] {
 	if (!isPiAgent) return [];
+	const model = spec.model?.trim();
+	if (model?.toLowerCase() === "pi") {
+		throw new Error('model: "pi" selects a model pattern, not the Pi agent tool. Use agentTool: "pi" to choose the Pi agent.');
+	}
 	const args = [...(spec.piFlags?.length ? spec.piFlags : ["--soloterm"] )];
-	if (spec.model?.trim()) args.push("--model", spec.model.trim());
+	if (model) args.push("--model", model);
 	if (spec.thinking?.trim()) args.push("--thinking", spec.thinking.trim());
 	return args;
 }

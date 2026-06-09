@@ -46,6 +46,13 @@ test("buildPiExtraArgs passes --soloterm only for Pi child agents", () => {
 	assert.deepEqual(buildPiExtraArgs({ name: "x", task: "y", model: "anthropic/sonnet", thinking: "high" }, false), []);
 });
 
+test("buildPiExtraArgs rejects model pi for Pi child agents", () => {
+	assert.throws(
+		() => buildPiExtraArgs({ name: "x", task: "y", model: "pi" }, true),
+		/model: "pi" selects a model pattern, not the Pi agent tool.*agentTool: "pi"/s,
+	);
+});
+
 test("buildSoloTaskPrompt tells child Pi agents to use solo_scratchpad", () => {
 	const prompt = buildSoloTaskPrompt(
 		{ name: "Review", task: "Review this", role: "reviewer" },
