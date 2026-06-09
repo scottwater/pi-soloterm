@@ -1,6 +1,6 @@
 {
   "name": "pi-soloterm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Optional Pi extension that exposes SoloTerm MCP features as native Pi tools.",
   "keywords": [
@@ -37,6 +37,7 @@
     "src/",
     "skills/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE.md"
   ]
