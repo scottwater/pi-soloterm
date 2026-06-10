@@ -8,6 +8,14 @@ The extension also provides a bundled `solo` skill as a fallback. If Pi already 
 
 ## Install
 
+From npm:
+
+```bash
+pi install pi-solo-term-tools
+```
+
+From GitHub:
+
 ```bash
 pi install https://github.com/scottwater/pi-soloterm-tools
 ```
