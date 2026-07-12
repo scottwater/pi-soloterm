@@ -49,7 +49,7 @@ async function listAgentTools(client: SoloMcpClient): Promise<string | undefined
 	}
 }
 
-export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string): string {
+export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string, refreshError?: string): string {
 	const client = deps.client;
 	const taskMissing = missing(client, TASK_TOOLS);
 	const processMissing = missing(client, PROCESS_TOOLS);
@@ -74,7 +74,8 @@ export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string): str
 		`- Solo MCP disabled: ${yesNo(client.isMcpDisabled())}`,
 		`- Solo MCP tools discovered: ${client.tools.length}`,
 		`- Session identity: ${identity}`,
-		client.lastError ? `- Last error: ${client.lastError}` : undefined,
+		refreshError ? `- Refresh failed: ${refreshError}` : undefined,
+		client.lastError && client.lastError !== refreshError ? `- Last error: ${client.lastError}` : undefined,
 		`- Subagent support: ${taskMissing.length ? `missing ${taskMissing.join(", ")}` : "available"}`,
 		`- Process support: ${processMissing.length ? `missing ${processMissing.join(", ")}` : "available"}`,
 		`- Scratchpad support: ${scratchpadMissing.length ? `missing ${scratchpadMissing.join(", ")}` : "available"}`,
@@ -100,13 +101,14 @@ export function registerSoloStatusTool(pi: ExtensionAPI, deps: SoloStatusDeps): 
 			if (!deps.isActive()) {
 				return { content: [{ type: "text" as const, text: "SoloTerm mode is inactive. Run /soloterm on or start Pi with --soloterm." }] };
 			}
+			let refreshError: string | undefined;
 			try {
 				if (params.refresh !== false) await deps.client.refreshTools();
-			} catch {
-				// renderSoloStatus includes the client's failed state and lastError.
+			} catch (error) {
+				refreshError = error instanceof Error ? error.message : String(error);
 			}
-			const agentTools = await listAgentTools(deps.client);
-			return { content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools) }] };
+			const agentTools = refreshError ? undefined : await listAgentTools(deps.client);
+			return { content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools, refreshError) }] };
 		},
 		renderCall(_args: Record<string, any>, theme: any) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);

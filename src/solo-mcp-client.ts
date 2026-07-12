@@ -105,6 +105,8 @@ export interface SoloMcpClientOptions {
 	clientName?: string;
 	clientVersion?: string;
 	idleCloseMs?: number;
+	requestTimeoutMs?: number;
+	diagnosticLimit?: number;
 	exists?: (path: string) => boolean;
 	spawn?: SoloMcpSpawn;
 	onStateChange?: (client: SoloMcpClient) => void;
@@ -195,6 +197,8 @@ export class SoloMcpClient implements SoloCallToolLike {
 	private readonly clientName: string;
 	private readonly clientVersion: string;
 	private readonly idleCloseMs: number;
+	private readonly requestTimeoutMs: number;
+	private readonly diagnosticLimit: number;
 	private readonly exists: (path: string) => boolean;
 	private readonly spawnTransport: SoloMcpSpawn;
 	private readonly onStateChange?: (client: SoloMcpClient) => void;
@@ -202,8 +206,10 @@ export class SoloMcpClient implements SoloCallToolLike {
 
 	private child?: SoloMcpTransport;
 	private buf = "";
+	private diagnostics = "";
 	private nextId = 1;
 	private stopped = false;
+	private generation = 0;
 	private idleTimer?: NodeJS.Timeout;
 	private ensurePromise?: Promise<void>;
 	private pending = new Map<
@@ -224,13 +230,17 @@ export class SoloMcpClient implements SoloCallToolLike {
 		this.clientName = options.clientName ?? "pi-soloterm";
 		this.clientVersion = options.clientVersion ?? "0.1.0";
 		this.idleCloseMs = options.idleCloseMs ?? 5_000;
+		this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+		this.diagnosticLimit = options.diagnosticLimit ?? 4_096;
 		this.exists = options.exists ?? existsSync;
 		this.spawnTransport = options.spawn ?? defaultSpawn;
 		this.onStateChange = options.onStateChange;
 	}
 
 	async start(): Promise<void> {
-		if (this.stopped) return;
+		// stop() is also used when /soloterm is turned off. A later start must
+		// revive the client rather than leaving it permanently stopped.
+		this.stopped = false;
 		if (!this.exists(this.helperPath)) {
 			this.failState(`Solo MCP helper not found at ${this.helperPath}`);
 			return;
@@ -241,9 +251,15 @@ export class SoloMcpClient implements SoloCallToolLike {
 
 	stop(): void {
 		this.stopped = true;
+		this.generation++;
 		if (this.idleTimer) clearTimeout(this.idleTimer);
 		this.idleTimer = undefined;
+		this.failPending(new Error("Solo MCP client stopped"));
 		this.killChild();
+		this.ensurePromise = undefined;
+		this.tools = [];
+		this.serverInfo = undefined;
+		this.identity = undefined;
 		this.state = "stopped";
 		this.emitState();
 	}
@@ -256,9 +272,16 @@ export class SoloMcpClient implements SoloCallToolLike {
 	}
 
 	async refreshTools(): Promise<void> {
-		await this.ensureChild();
-		await this.loadTools();
-		this.touchIdle();
+		try {
+			await this.ensureChild();
+			await this.loadTools();
+			this.lastError = undefined;
+			this.touchIdle();
+		} catch (error) {
+			const message = this.errorMessage(error);
+			this.invalidateTransport(message);
+			throw new Error(message);
+		}
 	}
 
 	hasTool(name: string): boolean {
@@ -302,24 +325,29 @@ export class SoloMcpClient implements SoloCallToolLike {
 		this.lastError = undefined;
 		this.emitState();
 
-		this.ensurePromise = (async () => {
+		const generation = this.generation;
+		const ensurePromise = (async () => {
 			try {
 				this.spawnChild();
 				await this.handshake();
 				await this.loadTools();
 				await this.identifySession();
+				if (generation !== this.generation || this.stopped) throw new Error("Solo MCP client stopped");
 				this.state = "ready";
 				this.lastError = undefined;
 				this.emitState();
 			} catch (error) {
-				this.killChild();
-				this.failState(error instanceof Error ? error.message : String(error));
+				if (generation === this.generation) {
+					this.killChild();
+					if (!this.stopped) this.failState(error instanceof Error ? error.message : String(error));
+				}
 				throw error;
 			} finally {
-				this.ensurePromise = undefined;
+				if (this.ensurePromise === ensurePromise) this.ensurePromise = undefined;
 			}
 		})();
-		return this.ensurePromise;
+		this.ensurePromise = ensurePromise;
+		return ensurePromise;
 	}
 
 	private spawnChild(): void {
@@ -329,23 +357,24 @@ export class SoloMcpClient implements SoloCallToolLike {
 		const child = this.spawnTransport(this.helperPath, [], { stdio: ["pipe", "pipe", "pipe"], env });
 		this.child = child;
 		this.buf = "";
+		this.diagnostics = "";
+		// Metadata belongs to one transport session and must never leak across reconnects.
+		this.tools = [];
+		this.serverInfo = undefined;
+		this.identity = undefined;
 
 		child.stdout.setEncoding?.("utf8");
 		child.stdout.on("data", (chunk: Buffer | string) => this.handleStdout(String(chunk)));
 		child.stderr.setEncoding?.("utf8");
-		child.stderr.on("data", () => {
-			// Solo helper logs are intentionally not surfaced unless a request fails.
-		});
+		child.stderr.on("data", (chunk: Buffer | string) => this.appendDiagnostic(`stderr: ${String(chunk)}`));
 		child.on("exit", (code, signal) => {
-			this.failPending(new Error(`Solo MCP helper exited (code=${code ?? "?"} signal=${signal ?? "?"})`));
-			this.child = undefined;
-			if (!this.stopped && this.state === "ready") {
-				this.state = "stopped";
-				this.emitState();
-			}
+			if (this.child !== child) return;
+			const message = `Solo MCP helper exited (code=${code ?? "?"} signal=${signal ?? "?"})`;
+			this.invalidateTransport(message, false);
 		});
 		child.on("error", (error) => {
-			this.lastError = error.message;
+			if (this.child !== child) return;
+			this.invalidateTransport(`Solo MCP transport error: ${error.message}`, false);
 		});
 	}
 
@@ -357,7 +386,11 @@ export class SoloMcpClient implements SoloCallToolLike {
 			const line = this.buf.slice(0, newline);
 			this.buf = this.buf.slice(newline + 1);
 			const message = parseJsonRpcLine(line);
-			if (!message || !("id" in message)) continue;
+			if (!message) {
+				this.appendDiagnostic(`protocol: ${line}\n`);
+				continue;
+			}
+			if (!("id" in message)) continue;
 			this.handleResponse(message as JsonRpcResponse);
 		}
 	}
@@ -400,7 +433,7 @@ export class SoloMcpClient implements SoloCallToolLike {
 		}
 	}
 
-	private request<T>(method: string, params?: unknown, timeoutMs = 30_000): Promise<T> {
+	private request<T>(method: string, params?: unknown, timeoutMs = this.requestTimeoutMs): Promise<T> {
 		const child = this.child;
 		if (!child) return Promise.reject(new Error("Solo MCP helper not running"));
 
@@ -410,7 +443,9 @@ export class SoloMcpClient implements SoloCallToolLike {
 		return new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error(`Solo MCP request '${method}' timed out after ${timeoutMs}ms`));
+				const message = `Solo MCP request '${method}' timed out after ${timeoutMs}ms`;
+				reject(new Error(this.withDiagnostics(message)));
+				this.invalidateTransport(message);
 			}, timeoutMs);
 
 			this.pending.set(id, {
@@ -420,11 +455,19 @@ export class SoloMcpClient implements SoloCallToolLike {
 			});
 
 			try {
-				child.stdin.write(`${JSON.stringify(payload)}\n`);
+				child.stdin.write(`${JSON.stringify(payload)}\n`, (error?: Error | null) => {
+					if (!error || !this.pending.has(id)) return;
+					clearTimeout(timer);
+					this.pending.delete(id);
+					reject(error);
+					this.invalidateTransport(`Solo MCP transport write failed: ${error.message}`);
+				});
 			} catch (error) {
 				clearTimeout(timer);
 				this.pending.delete(id);
-				reject(error instanceof Error ? error : new Error(String(error)));
+				const failure = error instanceof Error ? error : new Error(String(error));
+				reject(failure);
+				this.invalidateTransport(`Solo MCP transport write failed: ${failure.message}`);
 			}
 		});
 	}
@@ -475,6 +518,31 @@ export class SoloMcpClient implements SoloCallToolLike {
 			handler.reject(error);
 		}
 		this.pending.clear();
+	}
+
+	private appendDiagnostic(text: string): void {
+		this.diagnostics = (this.diagnostics + text).slice(-this.diagnosticLimit);
+	}
+
+	private withDiagnostics(message: string): string {
+		const detail = this.diagnostics.trim();
+		return detail ? `${message}; diagnostics: ${detail}` : message;
+	}
+
+	private errorMessage(error: unknown): string {
+		return this.withDiagnostics(error instanceof Error ? error.message : String(error));
+	}
+
+	private invalidateTransport(message: string, kill = true): void {
+		const error = new Error(this.withDiagnostics(message));
+		this.failPending(error);
+		if (kill) this.killChild();
+		else this.child = undefined;
+		this.buf = "";
+		this.tools = [];
+		this.serverInfo = undefined;
+		this.identity = undefined;
+		if (!this.stopped) this.failState(error.message);
 	}
 
 	private failState(message: string): void {

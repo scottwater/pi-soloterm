@@ -11,6 +11,8 @@ import {
 	mcpContentToText,
 } from "../src/solo-mcp-client.ts";
 
+const NO_RESPONSE = Symbol("no response");
+
 class FakeSoloHelper extends EventEmitter {
 	stdout = new PassThrough();
 	stderr = new PassThrough();
@@ -31,7 +33,7 @@ class FakeSoloHelper extends EventEmitter {
 					this.requests.push(request);
 					try {
 						const result = this.handlers[request.method]?.(request.params) ?? {};
-						this.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
+						if (result !== NO_RESPONSE) this.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
 					} catch (error) {
 						this.stdout.write(
 							`${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } })}\n`,
@@ -92,6 +94,117 @@ test("SoloMcpClient handshakes, lists catalog, and calls tools with fake helper"
 
 	client.stop();
 	assert.equal(helper.killed, true);
+});
+
+test("SoloMcpClient reconnects after stop and does not retain stale metadata", async () => {
+	let spawnCount = 0;
+	let catalog = [{ name: "old_tool" }];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		spawn: () => {
+			spawnCount++;
+			return new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: catalog }),
+			}) as any;
+		},
+	});
+
+	await client.start();
+	assert.equal(client.hasTool("old_tool"), true);
+	client.stop();
+	catalog = [{ name: "new_tool" }];
+	await client.start();
+	assert.equal(spawnCount, 2);
+	assert.equal(client.hasTool("old_tool"), false);
+	assert.equal(client.hasTool("new_tool"), true);
+	client.stop();
+});
+
+test("stop aborts an in-flight startup and a later start uses a fresh transport", async () => {
+	let spawnCount = 0;
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		requestTimeoutMs: 1_000,
+		spawn: () => {
+			spawnCount++;
+			return new FakeSoloHelper(
+				spawnCount === 1
+					? { initialize: () => NO_RESPONSE }
+					: {
+							initialize: () => ({ protocolVersion: "2024-11-05" }),
+							"tools/list": () => ({ tools: [{ name: "fresh_tool" }] }),
+						},
+			) as any;
+		},
+	});
+
+	const firstStart = client.start();
+	await new Promise((resolve) => setImmediate(resolve));
+	client.stop();
+	await assert.rejects(firstStart, /client stopped/);
+	assert.equal(client.state, "stopped");
+
+	await client.start();
+	assert.equal(spawnCount, 2);
+	assert.equal(client.state, "ready");
+	assert.equal(client.hasTool("fresh_tool"), true);
+	client.stop();
+});
+
+test("request timeout invalidates transport, metadata, and includes bounded diagnostics", async () => {
+	let helper!: FakeSoloHelper;
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		requestTimeoutMs: 15,
+		diagnosticLimit: 32,
+		spawn: () => {
+			helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "hang" }] }),
+				"tools/call": () => NO_RESPONSE,
+			});
+			return helper as any;
+		},
+	});
+
+	await client.start();
+	helper.stderr.write("a diagnostic message that is intentionally longer than the cap");
+	await assert.rejects(client.callTool("hang"), /timed out.*diagnostics:/);
+	assert.equal(client.state, "failed");
+	assert.deepEqual(client.tools, []);
+	assert.equal(helper.killed, true);
+	assert.ok((client.lastError?.length ?? 0) < 160);
+});
+
+test("transport errors reject pending requests and clear tool metadata", async () => {
+	let helper!: FakeSoloHelper;
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		spawn: () => {
+			helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "hang" }] }),
+				"tools/call": () => NO_RESPONSE,
+			});
+			return helper as any;
+		},
+	});
+	await client.start();
+	const pending = client.callTool("hang");
+	await new Promise((resolve) => setImmediate(resolve));
+	helper.emit("error", new Error("broken pipe"));
+	await assert.rejects(pending, /transport error: broken pipe/);
+	assert.equal(client.state, "failed");
+	assert.deepEqual(client.tools, []);
 });
 
 test("tool-call error detection catches MCP isError and Solo failure text", () => {
