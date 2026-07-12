@@ -74,6 +74,7 @@ export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string, refr
 		`- Solo MCP disabled: ${yesNo(client.isMcpDisabled())}`,
 		`- Solo MCP tools discovered: ${client.tools.length}`,
 		`- Session identity: ${identity}`,
+		client.identityError ? `- Identity diagnostic: ${client.identityError}` : undefined,
 		refreshError ? `- Refresh failed: ${refreshError}` : undefined,
 		client.lastError && client.lastError !== refreshError ? `- Last error: ${client.lastError}` : undefined,
 		`- Subagent support: ${taskMissing.length ? `missing ${taskMissing.join(", ")}` : "available"}`,

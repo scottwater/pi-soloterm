@@ -117,6 +117,7 @@ export interface SoloCallToolLike {
 	hasTool(name: string): boolean;
 	tools: McpToolDef[];
 	identity?: SoloIdentity;
+	identityError?: string;
 }
 
 export function parseJsonRpcLine(line: string): JsonRpcMessage | undefined {
@@ -221,6 +222,7 @@ export class SoloMcpClient implements SoloCallToolLike {
 	tools: McpToolDef[] = [];
 	serverInfo?: McpInitializeResult;
 	identity?: SoloIdentity;
+	identityError?: string;
 	lastError?: string;
 
 	constructor(options: SoloMcpClientOptions = {}) {
@@ -422,14 +424,24 @@ export class SoloMcpClient implements SoloCallToolLike {
 	}
 
 	private async identifySession(): Promise<void> {
+		this.identity = undefined;
+		this.identityError = undefined;
 		const name = this.hasTool("identify_session") ? "identify_session" : this.hasTool("whoami") ? "whoami" : undefined;
-		if (!name) return;
+		if (!name) {
+			this.identityError = "Solo MCP does not expose identify_session or whoami";
+			return;
+		}
 		try {
 			const args = name === "identify_session" && this.soloProcessId ? { solo_process_id: Number(this.soloProcessId) } : {};
 			const result = await this.request<McpToolCallResult>("tools/call", { name, arguments: args });
+			if (soloToolResultIsError(result)) {
+				this.identityError = mcpContentToText(result) || `${name} returned an error`;
+				return;
+			}
 			this.identity = extractStructuredOrTextJson<SoloIdentity>(result);
-		} catch {
-			// Identity is useful but never required for SoloTerm operation.
+			if (!this.identity) this.identityError = `${name} returned no usable session identity`;
+		} catch (error) {
+			this.identityError = error instanceof Error ? error.message : String(error);
 		}
 	}
 
@@ -542,6 +554,7 @@ export class SoloMcpClient implements SoloCallToolLike {
 		this.tools = [];
 		this.serverInfo = undefined;
 		this.identity = undefined;
+		this.identityError = undefined;
 		if (!this.stopped) this.failState(error.message);
 	}
 

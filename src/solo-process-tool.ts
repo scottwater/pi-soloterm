@@ -28,7 +28,7 @@ const SoloTermProcessParams = Type.Object({
 		}),
 	),
 	dryRun: Type.Optional(Type.Boolean({ description: "For close_subagents, report matching processes without closing them." })),
-	allowCurrent: Type.Optional(Type.Boolean({ description: "Allow action=close to close the current Pi/Solo process. Defaults to false." })),
+	allowCurrent: Type.Optional(Type.Boolean({ description: "Allow close to target the current process, or explicitly waive current-session protection when identity is unavailable. Defaults to false." })),
 });
 
 type SoloTermProcessArgs = Static<typeof SoloTermProcessParams>;
@@ -81,6 +81,15 @@ function effectiveProjectId(client: SoloCallToolLike, params: SoloTermProcessArg
 
 function scopedArgs(projectId: number | undefined): Record<string, number> {
 	return projectId == null ? {} : { project_id: projectId };
+}
+
+function destructiveScopeError(client: SoloCallToolLike, params: SoloTermProcessArgs, requireCurrentIdentity = true): string | undefined {
+	const missing: string[] = [];
+	if (effectiveProjectId(client, params) == null) missing.push("project identity (pass projectId explicitly)");
+	if (requireCurrentIdentity && currentProcessId(client) == null && params.allowCurrent !== true) missing.push("current-process identity (pass allowCurrent=true to explicitly waive this protection)");
+	if (!missing.length) return undefined;
+	const diagnostic = client.identityError ? ` Identity diagnostic: ${client.identityError}.` : " Run solo_status for identity diagnostics.";
+	return `Refusing destructive process operation without ${missing.join(" and ")}.${diagnostic}`;
 }
 
 function processIdOf(process: SoloProcessRecord): number | undefined {
@@ -250,22 +259,33 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 				if (action === "close") {
 					if (!has("close_process")) return unavailable("Solo close_process MCP tool is not available.");
 					if (params.processId == null) return unavailable("solo_process close requires processId.");
+					const scopeError = destructiveScopeError(deps.client, params);
+					if (scopeError) return unavailable(scopeError);
 					const currentId = currentProcessId(deps.client);
 					if (params.allowCurrent !== true && currentId != null && params.processId === currentId) {
 						return unavailable("Refusing to close the current Solo/Pi process. Pass allowCurrent=true only if you really intend to close this session.");
 					}
 					const process = { id: params.processId, name: `process ${params.processId}` };
 					const result = await closeOne(deps.client, process, projectId);
+					let verificationError: string | undefined;
+					if (result.ok && has("list_processes")) {
+						const verification = await listProcesses(deps.client, projectId);
+						if (soloToolResultIsError(verification.result)) verificationError = `close verification failed: ${resultToText(verification.result) || "list_processes failed"}`;
+						else if (verification.processes.some((item) => processIdOf(item) === params.processId && isActiveProcess(item))) verificationError = "close verification failed: process is still active";
+					}
+					const error = result.error ?? verificationError;
 					return {
-						content: [{ type: "text" as const, text: result.ok ? `Closed Solo process #${params.processId}.` : `Failed to close Solo process #${params.processId}: ${result.error}` }],
-						isError: !result.ok,
-						details: { projectId, result },
+						content: [{ type: "text" as const, text: result.ok && !verificationError ? `Closed Solo process #${params.processId}.` : `Failed to close Solo process #${params.processId}: ${error}` }],
+						isError: !result.ok || Boolean(verificationError),
+						details: { projectId, result, verificationError },
 					};
 				}
 
 				if (action === "close_subagents" || action === "close_subagent") {
 					if (!has("list_processes")) return unavailable("Solo list_processes MCP tool is not available.");
 					if (!has("close_process")) return unavailable("Solo close_process MCP tool is not available.");
+					const scopeError = destructiveScopeError(deps.client, params, params.dryRun !== true);
+					if (scopeError) return unavailable(scopeError);
 					const currentId = currentProcessId(deps.client);
 					const { result, processes } = await listProcesses(deps.client, projectId);
 					if (soloToolResultIsError(result)) return unavailable(resultToText(result) || "list_processes failed.");
@@ -275,13 +295,22 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					}
 					const results: CloseResult[] = [];
 					for (const target of targets) results.push(await closeOne(deps.client, target, projectId));
-					const after = await listProcesses(deps.client, projectId).catch(() => undefined);
-					const remaining = after?.processes.filter((process) => matchesCloseSubagentFilter(process, params, currentId));
-					const failed = results.some((closeResult) => !closeResult.ok);
+					let after: Awaited<ReturnType<typeof listProcesses>> | undefined;
+					let verificationError: string | undefined;
+					try {
+						after = await listProcesses(deps.client, projectId);
+						if (soloToolResultIsError(after.result)) verificationError = resultToText(after.result) || "list_processes failed";
+					} catch (error) {
+						verificationError = error instanceof Error ? error.message : String(error);
+					}
+					const remaining = verificationError ? undefined : after?.processes.filter((process) => matchesCloseSubagentFilter(process, params, currentId));
+					if (remaining?.length) verificationError = `${remaining.length} matching process${remaining.length === 1 ? " remains" : "es remain"} active`;
+					const failed = results.some((closeResult) => !closeResult.ok) || Boolean(verificationError);
+					const summary = `${summarizeCloseResults(targets, results, remaining)}${verificationError ? `\n\nVerification failed: ${verificationError}` : ""}`;
 					return {
-						content: [{ type: "text" as const, text: summarizeCloseResults(targets, results, remaining) }],
+						content: [{ type: "text" as const, text: summary }],
 						isError: failed,
-						details: { projectId, closed: results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)), failed: results.filter((closeResult) => !closeResult.ok), remaining },
+						details: { projectId, closed: results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)), failed: results.filter((closeResult) => !closeResult.ok), remaining, verificationError },
 					};
 				}
 
