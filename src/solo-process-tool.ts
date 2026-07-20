@@ -350,7 +350,7 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 			try {
 				if (action === "list") {
 					if (!has("list_processes")) return unavailable("Solo list_processes MCP tool is not available.");
-					const { result, processes } = await listProcesses(deps.client, projectId);
+					const { result, processes } = await listProcesses(deps.client, projectId, signal);
 					if (soloToolResultIsError(result)) return unavailable(resultToText(result) || "list_processes failed.");
 					const filtered = filterListedProcesses(processes, params);
 					return { content: [{ type: "text" as const, text: formatProcesses(filtered) }], details: { projectId, processes: filtered } };
@@ -359,7 +359,7 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 				if (action === "status") {
 					if (!has("get_process_status")) return unavailable("Solo get_process_status MCP tool is not available.");
 					if (params.processId == null) return unavailable("solo_process status requires processId.");
-					const result = await deps.client.callTool("get_process_status", { ...scopedArgs(projectId), process_id: params.processId });
+					const result = await callToolAbortable(deps.client, "get_process_status", { ...scopedArgs(projectId), process_id: params.processId }, signal);
 					const text = resultToText(result);
 					if (soloToolResultIsError(result)) throw new Error(text || "get_process_status failed.");
 					return { content: [{ type: "text" as const, text }], details: { result } };
@@ -369,7 +369,7 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					const tool = params.raw === true && has("get_process_raw_output") ? "get_process_raw_output" : "get_process_output";
 					if (!has(tool)) return unavailable(`Solo ${tool} MCP tool is not available.`);
 					if (params.processId == null) return unavailable("solo_process output requires processId.");
-					const result = await deps.client.callTool(tool, { ...scopedArgs(projectId), process_id: params.processId, lines: params.lines ?? 200 });
+					const result = await callToolAbortable(deps.client, tool, { ...scopedArgs(projectId), process_id: params.processId, lines: params.lines ?? 200 }, signal);
 					const text = mcpContentToText(result) || resultToText(result);
 					if (soloToolResultIsError(result)) throw new Error(text || `${tool} failed.`);
 					return { content: [{ type: "text" as const, text }], details: { result } };
@@ -380,7 +380,7 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					if (params.processId == null) return unavailable("solo_process send requires processId.");
 					const input = [params.input, params.message].find((value) => typeof value === "string" && value.trim().length > 0);
 					if (input == null) return unavailable("solo_process send requires non-empty input or message.");
-					const result = await deps.client.callTool("send_input", { process_id: params.processId, input, submit: true }, signal);
+					const result = await callToolAbortable(deps.client, "send_input", { process_id: params.processId, input, submit: true }, signal);
 					const text = resultToText(result);
 					if (soloToolResultIsError(result)) throw new Error(text || "send_input failed.");
 					return {
