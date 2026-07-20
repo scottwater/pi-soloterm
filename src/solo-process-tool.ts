@@ -35,10 +35,18 @@ const SoloTermProcessParams = Type.Object({
 
 type SoloTermProcessArgs = Static<typeof SoloTermProcessParams>;
 
+export interface SoloProcessRuntime {
+	delay: (ms: number, signal?: AbortSignal) => Promise<void>;
+	verificationPollMs: number;
+	verificationAttempts: number;
+	closeRetryPollMs: number;
+}
+
 export interface SoloTermProcessDeps {
 	client: SoloCallToolLike;
 	isActive: () => boolean;
 	isClientReady: () => boolean;
+	runtime?: SoloProcessRuntime;
 }
 
 export interface SoloProcessRecord {
@@ -168,8 +176,50 @@ function formatProcesses(processes: readonly SoloProcessRecord[], heading = "Sol
 	return `${heading}: ${processes.length}\n${processes.map(formatProcess).join("\n")}`;
 }
 
-async function listProcesses(client: SoloCallToolLike, projectId?: number): Promise<{ result: McpToolCallResult; processes: SoloProcessRecord[] }> {
-	const result = await client.callTool("list_processes", scopedArgs(projectId));
+function cancellationError(signal: AbortSignal): Error {
+	const reason = signal.reason instanceof Error ? signal.reason.message : signal.reason == null ? "operation aborted" : String(signal.reason);
+	const error = new Error(`solo_process cancelled: ${reason}`);
+	error.name = "AbortError";
+	return error;
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+	if (signal?.aborted) throw cancellationError(signal);
+}
+
+async function callToolAbortable(client: SoloCallToolLike, name: string, args: unknown, signal?: AbortSignal): Promise<McpToolCallResult> {
+	throwIfCancelled(signal);
+	const request = Promise.resolve().then(() => signal
+		? client.callTool(name, args, signal)
+		: client.callTool(name, args));
+	if (!signal) return request;
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		const abort = () => {
+			if (finished) return;
+			finished = true;
+			reject(cancellationError(signal));
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		request.then(
+			(result) => {
+				if (finished) return;
+				finished = true;
+				signal.removeEventListener("abort", abort);
+				resolve(result);
+			},
+			(error) => {
+				if (finished) return;
+				finished = true;
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+	});
+}
+
+async function listProcesses(client: SoloCallToolLike, projectId?: number, signal?: AbortSignal): Promise<{ result: McpToolCallResult; processes: SoloProcessRecord[] }> {
+	const result = await callToolAbortable(client, "list_processes", scopedArgs(projectId), signal);
 	return { result, processes: extractProcesses(result) };
 }
 
@@ -182,21 +232,48 @@ function filterListedProcesses(processes: SoloProcessRecord[], params: SoloTermP
 	});
 }
 
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+	throwIfCancelled(signal);
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(finish, ms);
+		function finish(): void {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		}
+		function abort(): void {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(cancellationError(signal!));
+		}
+		signal?.addEventListener("abort", abort, { once: true });
+	});
 }
 
-async function closeOne(client: SoloCallToolLike, process: SoloProcessRecord, projectId?: number): Promise<CloseResult> {
+const DEFAULT_PROCESS_RUNTIME: SoloProcessRuntime = {
+	delay: abortableDelay,
+	verificationPollMs: 150,
+	verificationAttempts: 5,
+	closeRetryPollMs: 300,
+};
+
+async function closeOne(
+	client: SoloCallToolLike,
+	process: SoloProcessRecord,
+	projectId: number | undefined,
+	signal: AbortSignal | undefined,
+	runtime: SoloProcessRuntime,
+): Promise<CloseResult> {
 	const processId = processIdOf(process);
 	if (processId == null) return { process, ok: false, error: "missing process id" };
 	let lastError = "unknown close_process error";
 	for (let attempt = 0; attempt < 4; attempt++) {
-		if (attempt > 0) await delay(300 * attempt);
+		if (attempt > 0) await runtime.delay(runtime.closeRetryPollMs * attempt, signal);
 		try {
-			const result = await client.callTool("close_process", { ...scopedArgs(projectId), process_id: processId });
+			const result = await callToolAbortable(client, "close_process", { ...scopedArgs(projectId), process_id: processId }, signal);
 			if (!soloToolResultIsError(result)) return { process, ok: true };
 			lastError = mcpContentToText(result) || "close_process returned an error";
 		} catch (error) {
+			if (error instanceof Error && error.name === "AbortError") throw error;
 			lastError = error instanceof Error ? error.message : String(error);
 		}
 		if (!/database is locked|busy|locked|timeout/i.test(lastError)) break;
@@ -204,13 +281,47 @@ async function closeOne(client: SoloCallToolLike, process: SoloProcessRecord, pr
 	return { process, ok: false, error: lastError };
 }
 
-function summarizeCloseResults(targets: SoloProcessRecord[], results: CloseResult[], remaining?: SoloProcessRecord[]): string {
-	const closed = results.filter((result) => result.ok);
+type CloseVerification =
+	| { status: "verified"; remaining: SoloProcessRecord[] }
+	| { status: "transport_failed"; error: string }
+	| { status: "still_active"; remaining: SoloProcessRecord[] };
+
+async function verifyClosed(
+	client: SoloCallToolLike,
+	projectId: number | undefined,
+	isTarget: (process: SoloProcessRecord) => boolean,
+	signal: AbortSignal | undefined,
+	runtime: SoloProcessRuntime,
+): Promise<CloseVerification> {
+	const attempts = Math.max(1, runtime.verificationAttempts);
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		throwIfCancelled(signal);
+		try {
+			const listed = await listProcesses(client, projectId, signal);
+			if (soloToolResultIsError(listed.result)) {
+				return { status: "transport_failed", error: resultToText(listed.result) || "list_processes failed" };
+			}
+			const remaining = listed.processes.filter((process) => isTarget(process) && isActiveProcess(process));
+			if (!remaining.length) return { status: "verified", remaining: [] };
+			if (attempt === attempts - 1) return { status: "still_active", remaining };
+		} catch (error) {
+			if (error instanceof Error && error.name === "AbortError") throw error;
+			return { status: "transport_failed", error: error instanceof Error ? error.message : String(error) };
+		}
+		await runtime.delay(runtime.verificationPollMs, signal);
+	}
+	return { status: "verified", remaining: [] };
+}
+
+function summarizeCloseResults(targets: SoloProcessRecord[], results: CloseResult[], verification: CloseVerification): string {
+	const requested = results.filter((result) => result.ok);
 	const failed = results.filter((result) => !result.ok);
-	const sections = [`Closed ${closed.length}/${targets.length} Solo subagent process${targets.length === 1 ? "" : "es"}.`];
-	if (closed.length) sections.push(`Closed:\n${closed.map((result) => `- ${formatProcess(result.process)}`).join("\n")}`);
-	if (failed.length) sections.push(`Failed:\n${failed.map((result) => `- ${formatProcess(result.process)}: ${result.error ?? "unknown error"}`).join("\n")}`);
-	if (remaining) sections.push(formatProcesses(remaining, "Remaining matching Solo subagents"));
+	const sections = [`Close requests succeeded for ${requested.length}/${targets.length} Solo subagent process${targets.length === 1 ? "" : "es"}.`];
+	if (requested.length) sections.push(`Close requested:\n${requested.map((result) => `- ${formatProcess(result.process)}`).join("\n")}`);
+	if (failed.length) sections.push(`Close request failed:\n${failed.map((result) => `- ${formatProcess(result.process)}: ${result.error ?? "unknown error"}`).join("\n")}`);
+	if (verification.status === "verified") sections.push("Verified closed: all successful close requests are no longer active.");
+	if (verification.status === "transport_failed") sections.push(`Verification transport failed after successful close request(s): ${verification.error}`);
+	if (verification.status === "still_active") sections.push(formatProcesses(verification.remaining, "Still active after verification grace"));
 	return sections.join("\n\n");
 }
 
@@ -234,6 +345,7 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 
 			const action = String(params.action ?? "list").trim().toLowerCase().replace(/-/g, "_");
 			const projectId = effectiveProjectId(deps.client, params);
+			const runtime = deps.runtime ?? DEFAULT_PROCESS_RUNTIME;
 			const has = (name: string) => deps.client.hasTool(name) || deps.client.canAttemptTool?.(name) === true;
 			try {
 				if (action === "list") {
@@ -287,22 +399,30 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 						return unavailable("Refusing to close the current Solo/Pi process. Pass allowCurrent=true only if you really intend to close this session.");
 					}
 					const process = { id: params.processId, name: `process ${params.processId}` };
-					const result = await closeOne(deps.client, process, projectId);
-					let verificationError: string | undefined;
-					if (result.ok && has("list_processes")) {
-						try {
-							const verification = await listProcesses(deps.client, projectId);
-							if (soloToolResultIsError(verification.result)) verificationError = resultToText(verification.result) || "list_processes failed";
-							else if (verification.processes.some((item) => processIdOf(item) === params.processId && isActiveProcess(item))) verificationError = "process is still active";
-						} catch (error) {
-							verificationError = error instanceof Error ? error.message : String(error);
-						}
+					const result = await closeOne(deps.client, process, projectId, signal, runtime);
+					if (!result.ok) throw new Error(`Close request failed for Solo process #${params.processId}: ${result.error ?? "unknown close error"}`);
+					if (!has("list_processes")) {
+						return {
+							content: [{ type: "text" as const, text: `Close request succeeded for Solo process #${params.processId}; verification unavailable.` }],
+							details: { projectId, result, verification: undefined },
+						};
 					}
-					if (!result.ok) throw new Error(`Failed to close Solo process #${params.processId}: ${result.error ?? "unknown close error"}`);
-					if (verificationError) throw new Error(`Closed Solo process #${params.processId}, but verification failed: ${verificationError}`);
+					const verification = await verifyClosed(
+						deps.client,
+						projectId,
+						(item) => processIdOf(item) === params.processId,
+						signal,
+						runtime,
+					);
+					if (verification.status === "transport_failed") {
+						throw new Error(`Close request succeeded for Solo process #${params.processId}, but verification transport failed: ${verification.error}`);
+					}
+					if (verification.status === "still_active") {
+						throw new Error(`Close request succeeded for Solo process #${params.processId}, but the process is still active after verification grace.`);
+					}
 					return {
-						content: [{ type: "text" as const, text: `Closed Solo process #${params.processId}.` }],
-						details: { projectId, result, verificationError },
+						content: [{ type: "text" as const, text: `Closed and verified Solo process #${params.processId}.` }],
+						details: { projectId, result, verification },
 					};
 				}
 
@@ -312,35 +432,42 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					const scopeError = destructiveScopeError(deps.client, params, params.dryRun !== true);
 					if (scopeError) return unavailable(scopeError);
 					const currentId = currentProcessId(deps.client);
-					const { result, processes } = await listProcesses(deps.client, projectId);
+					const { result, processes } = await listProcesses(deps.client, projectId, signal);
 					if (soloToolResultIsError(result)) return unavailable(resultToText(result) || "list_processes failed.");
 					const targets = processes.filter((process) => matchesCloseSubagentFilter(process, params, currentId));
 					if (params.dryRun === true) {
 						return { content: [{ type: "text" as const, text: formatProcesses(targets, "Matching Solo subagents (dry run)") }], details: { projectId, targets, dryRun: true } };
 					}
 					const results: CloseResult[] = [];
-					for (const target of targets) results.push(await closeOne(deps.client, target, projectId));
-					let after: Awaited<ReturnType<typeof listProcesses>> | undefined;
-					let verificationError: string | undefined;
-					try {
-						after = await listProcesses(deps.client, projectId);
-						if (soloToolResultIsError(after.result)) verificationError = resultToText(after.result) || "list_processes failed";
-					} catch (error) {
-						verificationError = error instanceof Error ? error.message : String(error);
-					}
-					const remaining = verificationError ? undefined : after?.processes.filter((process) => matchesCloseSubagentFilter(process, params, currentId));
-					if (remaining?.length) verificationError = `${remaining.length} matching process${remaining.length === 1 ? " remains" : "es remain"} active`;
-					const failed = results.some((closeResult) => !closeResult.ok) || Boolean(verificationError);
-					const summary = `${summarizeCloseResults(targets, results, remaining)}${verificationError ? `\n\nVerification failed: ${verificationError}` : ""}`;
+					for (const target of targets) results.push(await closeOne(deps.client, target, projectId, signal, runtime));
+					const requestedIds = new Set(results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)));
+					const verification: CloseVerification = requestedIds.size === 0
+						? { status: "verified", remaining: [] }
+						: await verifyClosed(
+							deps.client,
+							projectId,
+							(process) => requestedIds.has(processIdOf(process)),
+							signal,
+							runtime,
+						);
+					const failed = results.some((closeResult) => !closeResult.ok) || verification.status !== "verified";
+					const summary = summarizeCloseResults(targets, results, verification);
 					if (failed) throw new Error(summary);
 					return {
 						content: [{ type: "text" as const, text: summary }],
-						details: { projectId, closed: results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)), failed: [], remaining, verificationError },
+						details: {
+							projectId,
+							closed: results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)),
+							failed: results.filter((closeResult) => !closeResult.ok).map((closeResult) => ({ processId: processIdOf(closeResult.process), error: closeResult.error })),
+							remaining: [],
+							verification,
+						},
 					};
 				}
 
 				return unavailable(`Unknown solo_process action: ${action || "(empty)"}`);
 			} catch (error) {
+				if (error instanceof Error && error.name === "AbortError") throw error;
 				const message = error instanceof Error ? error.message : String(error);
 				return unavailable(`solo_process failed: ${message}`);
 			}

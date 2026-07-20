@@ -40,6 +40,8 @@ export interface SpawnedSoloTask {
 	artifactContent?: string;
 	status: SoloTaskStatus;
 	error?: string;
+	/** Whether the known Solo pane remains available for inspection. */
+	paneOpen?: boolean;
 }
 
 export interface SoloTaskSpec {
@@ -612,6 +614,7 @@ export async function runSoloTask(
 			output: output ? truncate(output, 40_000) : undefined,
 			artifactContent: artifactContent ? truncate(artifactContent, 40_000) : undefined,
 			status, error: completion.error,
+			paneOpen: spec.closeOnComplete !== true,
 		};
 	} catch (error) {
 		cleanupOutcome ??= await cleanupSoloProcess(client, processId, runtime.cleanupTimeoutMs);
@@ -625,6 +628,7 @@ export async function runSoloTask(
 			artifactScratchpadName: artifact?.name, artifactScratchpadId: artifact?.id,
 			status: "failed",
 			error: `${error instanceof Error ? error.message : String(error)}; ${cleanupOutcome.diagnostic}`,
+			paneOpen: cleanupOutcome.cleaned ? false : undefined,
 		};
 	}
 }
@@ -635,9 +639,12 @@ export function summarizeSoloTask(result: SpawnedSoloTask): string {
 	const artifact = result.artifactScratchpadName
 		? `\nArtifact: ${result.artifactScratchpadName}${result.artifactScratchpadId != null ? ` (#${result.artifactScratchpadId})` : ""}`
 		: "";
+	const pane = result.processId > 0 && result.paneOpen != null
+		? `\nPane: ${result.paneOpen ? `Solo process #${result.processId} remains open for inspection.` : `Solo process #${result.processId} was closed as requested.`}`
+		: "";
 	const captured = result.artifactContent || result.output;
 	const body = [result.error ? `Error: ${result.error}` : undefined, captured].filter(Boolean).join("\n\n") || "(no output captured)";
-	return `${title}${artifact}\n\n${body}`;
+	return `${title}${artifact}${pane}\n\n${body}`;
 }
 
 export function defaultTaskName(task: string, role?: string): string {

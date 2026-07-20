@@ -6,6 +6,7 @@ import {
 	classifyTerminalProcessStatus,
 	resolveSoloAgentTool,
 	runSoloTask,
+	summarizeSoloTask,
 	type SoloTaskRuntime,
 } from "../src/solo-subagents.ts";
 import type { McpToolCallResult, SoloCallToolLike } from "../src/solo-mcp-client.ts";
@@ -245,6 +246,36 @@ test("send_input retries a transient failure and then succeeds", async () => {
 	const result = await runSoloTask(client, { name: "retry", task: "work", wait: false }, undefined, runtime);
 	assert.equal(result.status, "started");
 	assert.equal(sends, 2);
+});
+
+test("terminal child failure remains open with its real identity and captured output", async () => {
+	const runtime = fakeRuntime();
+	let statusCalls = 0;
+	let closeCalls = 0;
+	const client = taskClient(async (name) => {
+		const base = baseResponse(name);
+		if (base && name !== "close_process") return base;
+		if (name === "send_input") return {};
+		if (name === "get_process_status") {
+			statusCalls += 1;
+			return statusCalls === 1
+				? { structuredContent: { status: "running", agent_state: { idle: true } } }
+				: { structuredContent: { status: "crashed", agent_state: { idle: false } } };
+		}
+		if (name === "close_process") {
+			closeCalls += 1;
+			return {};
+		}
+		throw new Error(`unexpected ${name}`);
+	});
+
+	const taskResult = await runSoloTask(client, { name: "inspect crash", task: "work" }, undefined, runtime);
+	assert.equal(taskResult.status, "crashed");
+	assert.equal(taskResult.processId, 42);
+	assert.equal(taskResult.output, "done");
+	assert.equal(taskResult.paneOpen, true);
+	assert.equal(closeCalls, 0);
+	assert.match(summarizeSoloTask(taskResult), /Solo process #42 remains open for inspection/);
 });
 
 test("retry exhaustion after spawn preserves process identity and closes the pane", async () => {

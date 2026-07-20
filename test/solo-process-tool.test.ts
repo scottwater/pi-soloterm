@@ -1,15 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { __test__, registerSoloTermProcessTool } from "../src/solo-process-tool.ts";
+import { __test__, registerSoloTermProcessTool, type SoloProcessRuntime } from "../src/solo-process-tool.ts";
 
-function processExecutor(client: any) {
+function processExecutor(client: any, runtime?: SoloProcessRuntime) {
 	let tool: any;
 	registerSoloTermProcessTool({ registerTool(value: any) { tool = value; } } as any, {
 		client,
 		isActive: () => true,
 		isClientReady: () => true,
+		runtime,
 	});
-	return (params: any) => tool.execute("test", params);
+	return (params: any, signal?: AbortSignal) => tool.execute("test", params, signal);
+}
+
+function fakeProcessRuntime(onDelay?: (signal?: AbortSignal) => void): SoloProcessRuntime {
+	return {
+		delay: async (_ms, signal) => { onDelay?.(signal); },
+		verificationPollMs: 1,
+		verificationAttempts: 3,
+		closeRetryPollMs: 1,
+	};
 }
 
 function result(data: unknown, isError = false) {
@@ -150,6 +160,25 @@ test("close permits explicit safety overrides and scopes close and verification"
 	]);
 });
 
+test("close reports a close request failure without claiming verification failed", async () => {
+	let listCalls = 0;
+	const execute = processExecutor({
+		tools: [], identity: { process_id: 99, project: { id: 7 } },
+		hasTool: (name: string) => ["close_process", "list_processes"].includes(name),
+		callTool: async (name: string) => {
+			if (name === "list_processes") listCalls += 1;
+			return { isError: true, content: [{ type: "text", text: "close denied" }] };
+		},
+	});
+
+	await assert.rejects(
+		execute({ action: "close", processId: 12 }),
+		(error: Error) => /Close request failed for Solo process #12: close denied/.test(error.message)
+			&& !/verification/i.test(error.message),
+	);
+	assert.equal(listCalls, 0);
+});
+
 test("close reports partial success when verification throws", async () => {
 	const execute = processExecutor({
 		tools: [], identity: { process_id: 99, project: { id: 7 } },
@@ -162,8 +191,8 @@ test("close reports partial success when verification throws", async () => {
 
 	await assert.rejects(
 		execute({ action: "close", processId: 12 }),
-		(error: Error) => /Closed Solo process #12/.test(error.message)
-			&& /verification failed/.test(error.message)
+		(error: Error) => /Close request succeeded for Solo process #12/.test(error.message)
+			&& /verification transport failed/.test(error.message)
 			&& /verification transport unavailable/.test(error.message),
 	);
 });
@@ -240,6 +269,78 @@ test("close_subagents requires overrides without identity and surfaces verificat
 	await assert.rejects(execute({ action: "close_subagents", projectId: 9 }), /current-process identity/);
 	await assert.rejects(
 		execute({ action: "close_subagents", projectId: 9, allowCurrent: true }),
-		/Verification failed: verification unavailable/,
+		/Verification transport failed after successful close request\(s\): verification unavailable/,
 	);
+});
+
+test("close verification polls until an active process disappears", async () => {
+	let listings = 0;
+	const runtime = fakeProcessRuntime();
+	const execute = processExecutor({
+		tools: [], identity: { process_id: 99, project: { id: 7 } },
+		hasTool: (name: string) => ["close_process", "list_processes"].includes(name),
+		callTool: async (name: string) => {
+			if (name === "close_process") return result({ ok: true });
+			listings += 1;
+			return result({ processes: listings === 1 ? [{ id: 12, status: "Running" }] : [] });
+		},
+	}, runtime);
+
+	const response = await execute({ action: "close", processId: 12 });
+	assert.match(response.content[0].text, /Closed and verified Solo process #12/);
+	assert.equal(listings, 2);
+});
+
+test("close verification reports a process still active after grace exhaustion", async () => {
+	let listings = 0;
+	const runtime = fakeProcessRuntime();
+	const execute = processExecutor({
+		tools: [], identity: { process_id: 99, project: { id: 7 } },
+		hasTool: (name: string) => ["close_process", "list_processes"].includes(name),
+		callTool: async (name: string) => {
+			if (name === "close_process") return result({ ok: true });
+			listings += 1;
+			return result({ processes: [{ id: 12, status: "Running" }] });
+		},
+	}, runtime);
+
+	await assert.rejects(execute({ action: "close", processId: 12 }), /still active after verification grace/);
+	assert.equal(listings, 3);
+});
+
+test("close verification cancellation interrupts the grace delay", async () => {
+	const controller = new AbortController();
+	const runtime = fakeProcessRuntime((signal) => {
+		assert.equal(signal, controller.signal);
+		controller.abort(new Error("stop close verification"));
+	});
+	const execute = processExecutor({
+		tools: [], identity: { process_id: 99, project: { id: 7 } },
+		hasTool: (name: string) => ["close_process", "list_processes"].includes(name),
+		callTool: async (name: string) => name === "close_process"
+			? result({ ok: true })
+			: result({ processes: [{ id: 12, status: "Running" }] }),
+	}, runtime);
+
+	await assert.rejects(execute({ action: "close", processId: 12 }, controller.signal), (error: Error) =>
+		error.name === "AbortError" && /stop close verification/.test(error.message));
+});
+
+test("close_subagents verification tolerates asynchronous process transitions", async () => {
+	let listings = 0;
+	const runtime = fakeProcessRuntime();
+	const execute = processExecutor({
+		tools: [], identity: { process_id: 5, project: { id: 9 } },
+		hasTool: (name: string) => ["close_process", "list_processes"].includes(name),
+		callTool: async (name: string) => {
+			if (name === "close_process") return result({ ok: true });
+			listings += 1;
+			if (listings <= 2) return result({ processes: [{ id: 6, status: "Running", command: "pi --soloterm" }] });
+			return result({ processes: [{ id: 6, status: "Exited", command: "pi --soloterm" }] });
+		},
+	}, runtime);
+
+	const response = await execute({ action: "close_subagents" });
+	assert.match(response.content[0].text, /Verified closed/);
+	assert.equal(listings, 3);
 });
