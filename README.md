@@ -2,7 +2,7 @@
 
 # pi-soloterm-tools
 
-Optional Pi extension that exposes SoloTerm MCP features as native Pi tools.
+Optional Pi extension that exposes a focused set of SoloTerm MCP features as native Pi tools.
 
 The extension also provides a bundled `solo` skill as a fallback. If Pi already has a `solo` skill available, this package leaves it alone; otherwise it contributes its bundled skill during resource discovery so agents know to use the SoloTerm bridge.
 
@@ -42,9 +42,13 @@ When active, the footer/status line shows `◫ soloterm`.
 
 - `solo_status` — verifies SoloTerm/Pi mode, Solo MCP state, session identity, and feature support.
 - `solo_task` — spawns Solo agent panes through Solo MCP, sends prompts, waits for idle output, and optionally uses scratchpad artifacts.
-- `solo_process` — lists, inspects, reads output from, and closes Solo-managed processes. Use `action: "close_subagents"` to safely close Pi-spawned `--soloterm` child-agent panes in the current/effective project.
+- `solo_process` — lists, inspects, reads output from, sends input to, and closes Solo-managed processes. Use `action: "send"` with `processId` and non-empty `input` (or `message`) to answer a prompt or grant a required approval. Use `action: "close_subagents"` to safely close Pi-spawned `--soloterm` child-agent panes in the current/effective project.
 - `solo_todo` — mirrors task lists to Solo todos when available and keeps a Pi fallback.
 - `solo_scratchpad` — lists, reads, and writes Solo scratchpads.
+
+This is a focused Pi surface: status and identity, agent dispatch, process list/status/output/input/close, todos, and scratchpads. Timers, locks, project management, ports, and broader Solo MCP catalog operations are not currently exposed as native Pi tools. The extension intentionally does not provide a generic passthrough because that would bypass operation-specific safety guards. Direct non-Pi MCP harnesses may independently discover optional tools from Solo's catalog.
+
+Spawned agents are not approved automatically. Monitor them with `solo_process` actions `status` and `output`; when an agent requires an answer or permission, use `action: "send"` with submit semantics.
 
 ## Solo setup
 

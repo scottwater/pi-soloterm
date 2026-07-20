@@ -15,7 +15,7 @@ export interface SoloStatusDeps {
 }
 
 const TASK_TOOLS = ["list_agent_tools", "spawn_agent", "send_input", "get_process_status"];
-const PROCESS_TOOLS = ["list_processes", "get_process_status", "get_process_output", "close_process"];
+const PROCESS_TOOLS = ["list_processes", "get_process_status", "get_process_output", "send_input", "close_process"];
 const SCRATCHPAD_TOOLS = ["scratchpad_list", "scratchpad_read", "scratchpad_write"];
 const TODO_TOOLS = ["todo_create", "todo_list", "todo_update", "todo_complete"];
 

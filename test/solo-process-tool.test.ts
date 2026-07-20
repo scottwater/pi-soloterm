@@ -57,6 +57,65 @@ test("close_subagents can include explicit Solo agent records", () => {
 	);
 });
 
+test("send submits non-empty input to an existing Solo process", async () => {
+	const calls: any[] = [];
+	const controller = new AbortController();
+	let tool: any;
+	registerSoloTermProcessTool({ registerTool(value: any) { tool = value; } } as any, {
+		client: {
+			tools: [],
+			hasTool: (name: string) => name === "send_input",
+			callTool: async (...args: any[]) => { calls.push(args); return result({ accepted: true }); },
+		},
+		isActive: () => true,
+		isClientReady: () => true,
+	});
+
+	const response = await tool.execute("test", { action: "send", processId: 42, input: "approve" }, controller.signal);
+	assert.equal("isError" in response, false);
+	assert.deepEqual(calls, [["send_input", { process_id: 42, input: "approve", submit: true }, controller.signal]]);
+	assert.match(response.content[0].text, /Sent input to Solo process #42/);
+});
+
+test("send can join MCP warm-up before the tool catalog is loaded", async () => {
+	const calls: any[] = [];
+	const execute = processExecutor({
+		tools: [],
+		hasTool: () => false,
+		canAttemptTool: (name: string) => name === "send_input",
+		callTool: async (...args: any[]) => { calls.push(args); return result({ accepted: true }); },
+	});
+
+	const response = await execute({ action: "send", processId: 8, input: "continue" });
+	assert.deepEqual(calls[0]?.slice(0, 2), ["send_input", { process_id: 8, input: "continue", submit: true }]);
+	assert.match(response.content[0].text, /Sent input to Solo process #8/);
+});
+
+test("send accepts message as an input alias and rejects missing or blank input", async () => {
+	const calls: any[] = [];
+	const execute = processExecutor({
+		tools: [],
+		hasTool: (name: string) => name === "send_input",
+		callTool: async (...args: any[]) => { calls.push(args); return result({ accepted: true }); },
+	});
+
+	await execute({ action: "send", processId: 7, message: "continue" });
+	assert.deepEqual(calls[0]?.slice(0, 2), ["send_input", { process_id: 7, input: "continue", submit: true }]);
+	await assert.rejects(execute({ action: "send", input: "continue" }), /requires processId/);
+	await assert.rejects(execute({ action: "send", processId: 7, input: "  " }), /requires non-empty input or message/);
+	assert.equal(calls.length, 1);
+});
+
+test("send preserves Solo send_input failures as thrown tool errors", async () => {
+	const execute = processExecutor({
+		tools: [],
+		hasTool: (name: string) => name === "send_input",
+		callTool: async () => ({ isError: true, content: [{ type: "text", text: "permission denied" }] }),
+	});
+
+	await assert.rejects(execute({ action: "send", processId: 7, input: "yes" }), /solo_process failed: permission denied/);
+});
+
 test("close refuses missing identity and reports diagnostics", async () => {
 	const calls: any[] = [];
 	const execute = processExecutor({

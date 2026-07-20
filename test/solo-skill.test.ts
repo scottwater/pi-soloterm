@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { BUNDLED_SOLO_SKILL_PATH, hasSoloSkill } from "../src/solo-skill.ts";
 
@@ -11,4 +11,14 @@ test("hasSoloSkill detects an existing Pi solo skill command", () => {
 
 test("bundled Solo skill is packaged in the repository", () => {
 	assert.equal(existsSync(BUNDLED_SOLO_SKILL_PATH), true);
+});
+
+test("bundled Solo skill describes the focused Pi surface and process input workflow", () => {
+	const skill = readFileSync(BUNDLED_SOLO_SKILL_PATH, "utf8");
+	assert.match(skill, /action: \"status\"/);
+	assert.match(skill, /action: \"output\"/);
+	assert.match(skill, /action: \"send\"/);
+	assert.match(skill, /Timers, locks, project management, ports/);
+	assert.doesNotMatch(skill, /acceptance:/);
+	assert.doesNotMatch(skill.split("---", 2)[1] ?? "", /timers/);
 });

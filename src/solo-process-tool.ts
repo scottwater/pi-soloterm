@@ -12,10 +12,12 @@ import {
 const SoloTermProcessParams = Type.Object({
 	action: Type.String({
 		description:
-			"Process operation: list, status, output, close, or close_subagents. close_subagents safely closes Pi --soloterm child-agent panes in the current/effective project.",
+			"Process operation: list, status, output, send, close, or close_subagents. close_subagents safely closes Pi --soloterm child-agent panes in the current/effective project.",
 	}),
 	projectId: Type.Optional(Type.Number({ description: "Solo project id. Defaults to Solo's effective/current project." })),
-	processId: Type.Optional(Type.Number({ description: "Solo process id for status, output, or close." })),
+	processId: Type.Optional(Type.Number({ description: "Solo process id for status, output, send, or close." })),
+	input: Type.Optional(Type.String({ description: "Non-empty input to send for action=send. Sent with submit semantics." })),
+	message: Type.Optional(Type.String({ description: "Alias for input when action=send." })),
 	lines: Type.Optional(Type.Number({ description: "Rendered output line count for action=output. Defaults to 200." })),
 	raw: Type.Optional(Type.Boolean({ description: "Use get_process_raw_output for action=output when available." })),
 	includeExited: Type.Optional(Type.Boolean({ description: "Include exited/stopped processes when listing or closing subagents. Defaults to false for close_subagents." })),
@@ -217,21 +219,22 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 		name: "solo_process",
 		label: "SoloTerm Process",
 		description:
-			"List, inspect, read output from, or close Solo-managed processes. Includes a safe close_subagents action for Pi-spawned SoloTerm subagent panes.",
-		promptSnippet: "Manage SoloTerm/Solo MCP processes: list, status, output, close, or close_subagents.",
+			"List, inspect, read output from, send input to, or close Solo-managed processes. Includes a safe close_subagents action for Pi-spawned SoloTerm subagent panes.",
+		promptSnippet: "Manage SoloTerm/Solo MCP processes: list, status, output, send, close, or close_subagents.",
 		promptGuidelines: [
-			"Use solo_process when asked to inspect, read output from, stop, close, or clean up existing Solo-managed processes.",
+			"Use solo_process when asked to inspect, read output from, send input to, stop, close, or clean up existing Solo-managed processes.",
+			"Monitor spawned agents with action=status and action=output. Use action=send with processId and non-empty input when an agent requires an answer or approval.",
 			"Use action=close_subagents to close Pi-spawned SoloTerm child agents; it excludes the current process and defaults to --soloterm child panes only.",
 			"Call solo_status first if SoloTerm/MCP readiness has not already been checked.",
 		],
 		parameters: SoloTermProcessParams,
-		async execute(_toolCallId, params: SoloTermProcessArgs, _signal: AbortSignal | undefined) {
+		async execute(_toolCallId, params: SoloTermProcessArgs, signal: AbortSignal | undefined) {
 			if (!deps.isActive()) return unavailable("SoloTerm mode is not active. Run /soloterm on or start Pi with --soloterm.");
 			if (!deps.isClientReady()) return unavailable("Solo MCP is not ready or enabled.");
 
 			const action = String(params.action ?? "list").trim().toLowerCase().replace(/-/g, "_");
 			const projectId = effectiveProjectId(deps.client, params);
-			const has = (name: string) => deps.client.hasTool(name);
+			const has = (name: string) => deps.client.hasTool(name) || deps.client.canAttemptTool?.(name) === true;
 			try {
 				if (action === "list") {
 					if (!has("list_processes")) return unavailable("Solo list_processes MCP tool is not available.");
@@ -258,6 +261,20 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					const text = mcpContentToText(result) || resultToText(result);
 					if (soloToolResultIsError(result)) throw new Error(text || `${tool} failed.`);
 					return { content: [{ type: "text" as const, text }], details: { result } };
+				}
+
+				if (action === "send") {
+					if (!has("send_input")) return unavailable("Solo send_input MCP tool is not available.");
+					if (params.processId == null) return unavailable("solo_process send requires processId.");
+					const input = [params.input, params.message].find((value) => typeof value === "string" && value.trim().length > 0);
+					if (input == null) return unavailable("solo_process send requires non-empty input or message.");
+					const result = await deps.client.callTool("send_input", { process_id: params.processId, input, submit: true }, signal);
+					const text = resultToText(result);
+					if (soloToolResultIsError(result)) throw new Error(text || "send_input failed.");
+					return {
+						content: [{ type: "text" as const, text: `Sent input to Solo process #${params.processId}.` }],
+						details: { result },
+					};
 				}
 
 				if (action === "close") {
