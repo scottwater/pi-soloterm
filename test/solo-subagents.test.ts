@@ -118,6 +118,7 @@ function fakeRuntime(onDelay?: (ms: number, signal?: AbortSignal) => void): Solo
 		idleGraceMs: 4,
 		idleConsecutive: 2,
 		readyTransientErrorLimit: 2,
+		idleTransientErrorLimit: 2,
 		cleanupTimeoutMs: 20,
 		elapsed: () => now,
 	};
@@ -149,6 +150,68 @@ test("a child that is stably idle without observed busy completes after a bounde
 	assert.equal(result.status, "completed");
 	assert.ok(statusCalls <= 5, `used ${statusCalls} status polls`);
 	assert.ok(runtime.elapsed() <= 8, `waited ${runtime.elapsed()}ms of logical time`);
+});
+
+test("transient status failures during the idle wait are retried without closing the pane", async () => {
+	const runtime = fakeRuntime();
+	let closeCalls = 0;
+	let sentInput = false;
+	let idlePolls = 0;
+	const client = taskClient(async (name) => {
+		if (name === "close_process") {
+			closeCalls += 1;
+			return {};
+		}
+		const base = baseResponse(name);
+		if (base) return base;
+		if (name === "send_input") {
+			sentInput = true;
+			return {};
+		}
+		if (name === "get_process_status") {
+			if (!sentInput) return { structuredContent: { status: "running", agent_state: { idle: true } } };
+			idlePolls += 1;
+			if (idlePolls === 1) return { structuredContent: { status: "running", agent_state: { idle: false } } };
+			if (idlePolls <= 3) throw new Error("transport blip");
+			return { structuredContent: { status: "running", agent_state: { idle: true } } };
+		}
+		throw new Error(`unexpected ${name}`);
+	});
+
+	const result = await runSoloTask(client, { name: "flaky wait", task: "work" }, undefined, runtime);
+	assert.equal(result.status, "completed");
+	assert.equal(closeCalls, 0, "a transient observation failure must never close the pane");
+});
+
+test("sustained status-poll failure ends the wait as failed and leaves the pane open", async () => {
+	const runtime = fakeRuntime();
+	let closeCalls = 0;
+	let sentInput = false;
+	const client = taskClient(async (name) => {
+		if (name === "close_process") {
+			closeCalls += 1;
+			return {};
+		}
+		const base = baseResponse(name);
+		if (base) return base;
+		if (name === "send_input") {
+			sentInput = true;
+			return {};
+		}
+		if (name === "get_process_status") {
+			if (!sentInput) return { structuredContent: { status: "running", agent_state: { idle: true } } };
+			throw new Error("persistent outage");
+		}
+		throw new Error(`unexpected ${name}`);
+	});
+
+	const result = await runSoloTask(client, { name: "blind wait", task: "work" }, undefined, runtime);
+	assert.equal(result.status, "failed");
+	assert.equal(result.processId, 42);
+	assert.match(result.error ?? "", /status polling failed 3 consecutive times/);
+	assert.match(result.error ?? "", /persistent outage/);
+	assert.equal(result.paneOpen, true, "an unobservable child must be left open for inspection");
+	assert.equal(closeCalls, 0, "polling exhaustion must not trigger cleanup");
 });
 
 test("initial readiness retries only a bounded number of transient thrown failures", async () => {

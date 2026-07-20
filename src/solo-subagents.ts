@@ -198,6 +198,7 @@ export interface SoloTaskRuntime {
 	idleGraceMs: number;
 	idleConsecutive: number;
 	readyTransientErrorLimit: number;
+	idleTransientErrorLimit: number;
 	cleanupTimeoutMs: number;
 }
 
@@ -278,6 +279,7 @@ const DEFAULT_TASK_RUNTIME: SoloTaskRuntime = {
 	idleGraceMs: 1_500,
 	idleConsecutive: 2,
 	readyTransientErrorLimit: 3,
+	idleTransientErrorLimit: 3,
 	cleanupTimeoutMs: 500,
 };
 
@@ -370,12 +372,35 @@ async function waitForIdle(
 	let sawBusy = false;
 	let idleSince: number | undefined;
 	let consecutiveIdle = 0;
+	let consecutiveFailures = 0;
 	while (runtime.now() - started < maxWaitMs) {
 		throwIfCancelled(signal);
-		const result = await callToolAbortable(client, "get_process_status", { process_id: processId }, signal);
-		throwIfCancelled(signal);
-		if (soloToolResultIsError(result)) throw new Error(`get_process_status failed: ${errorText(result)}`);
-		const data = extractStructuredOrTextJson<any>(result);
+		let data: any;
+		try {
+			const result = await callToolAbortable(client, "get_process_status", { process_id: processId }, signal);
+			throwIfCancelled(signal);
+			if (soloToolResultIsError(result)) throw new Error(`get_process_status failed: ${errorText(result)}`);
+			data = extractStructuredOrTextJson<any>(result);
+			consecutiveFailures = 0;
+		} catch (error) {
+			throwIfCancelled(signal);
+			// A failed observation says nothing about the child's health. Returning a
+			// completion (never throwing) keeps a possibly-working pane from being
+			// closed by runSoloTask's failure cleanup over a transport blip.
+			if (++consecutiveFailures > runtime.idleTransientErrorLimit) {
+				return {
+					status: "failed",
+					error: `status polling failed ${consecutiveFailures} consecutive times; last: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				};
+			}
+			// An unobserved window must not count toward the no-busy idle grace.
+			idleSince = undefined;
+			consecutiveIdle = 0;
+			await runtime.delay(runtime.idlePollMs, signal);
+			continue;
+		}
 		const state = data?.agent_state;
 		if (state?.thinking || state?.planning || state?.idle === false) {
 			sawBusy = true;
