@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	applySoloTermToolActivation,
 	getSoloTermStatusLabel,
@@ -81,7 +81,7 @@ export default function solotermExtension(pi: ExtensionAPI): void {
 		pi.appendEntry(SOLOTERM_STATE_ENTRY, makeSoloTermStateEntry(runtime.active, source));
 	}
 
-	async function setActive(active: boolean, ctx: ExtensionContext, source: "command" | "flag" | "restore", reload: boolean): Promise<void> {
+	async function setActive(active: boolean, ctx: ExtensionCommandContext, source: "command" | "flag" | "restore", reload: boolean): Promise<void> {
 		runtime.active = active;
 		runtime.source = source;
 		applyTools();
@@ -91,7 +91,7 @@ export default function solotermExtension(pi: ExtensionAPI): void {
 		else client.stop();
 		if (reload && ctx.hasUI) {
 			ctx.ui.notify(`SoloTerm ${active ? "enabled" : "disabled"}; reloading Pi resources…`, "info");
-			await ctx.reloadResources();
+			await ctx.reload();
 		} else if (ctx.hasUI) {
 			ctx.ui.notify(`SoloTerm ${active ? "enabled" : "disabled"}.`, "info");
 		}
