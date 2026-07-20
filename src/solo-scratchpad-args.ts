@@ -38,9 +38,11 @@ export function prepareSoloTermScratchpadArgs(args: unknown): PreparedScratchpad
 }
 
 export async function resolveScratchpadIdByName(client: SoloCallToolLike, name: string): Promise<number | undefined> {
-	if (!client.hasTool("scratchpad_list")) return undefined;
+	if (!client.hasTool("scratchpad_list")) {
+		throw new Error("Solo scratchpad_list MCP tool is required to resolve a scratchpad by name.");
+	}
 	const result = await client.callTool("scratchpad_list", {});
-	if (soloToolResultIsError(result)) return undefined;
+	if (soloToolResultIsError(result)) throw new Error(mcpContentToText(result) || "scratchpad_list failed while resolving name.");
 	const data = extractStructuredOrTextJson<any>(result);
 	const scratchpads = Array.isArray(data?.scratchpads) ? data.scratchpads : Array.isArray(data) ? data : [];
 	const match = scratchpads.find((scratchpad: any) => scratchpad?.name === name);

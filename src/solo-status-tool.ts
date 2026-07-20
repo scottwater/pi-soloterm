@@ -100,24 +100,22 @@ export function registerSoloStatusTool(pi: ExtensionAPI, deps: SoloStatusDeps): 
 		parameters: SoloStatusParams as any,
 		async execute(_toolCallId, params: SoloStatusArgs) {
 			if (!deps.isActive()) {
-				return { content: [{ type: "text" as const, text: "SoloTerm mode is inactive. Run /soloterm on or start Pi with --soloterm." }] };
+				throw new Error("SoloTerm mode is inactive. Run /soloterm on or start Pi with --soloterm.");
 			}
-			let refreshError: string | undefined;
 			try {
 				if (params.refresh !== false) await deps.client.refreshTools();
 			} catch (error) {
-				refreshError = error instanceof Error ? error.message : String(error);
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(`solo_status refresh failed: ${message}`);
 			}
-			const agentTools = refreshError ? undefined : await listAgentTools(deps.client);
-			return { content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools, refreshError) }] };
+			const agentTools = await listAgentTools(deps.client);
+			return { content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools) }] };
 		},
 		renderCall(_args: Record<string, any>, theme: any) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any) {
-			const text = String(result.content?.[0]?.text ?? "solo_status");
-			const error = /failed|missing|disabled|inactive/i.test(text) && !/available/.test(text);
-			return new Text(`${theme.fg(error ? "error" : "success", error ? "✘" : "✓")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);
+		renderResult(_result: any, _opts: any, theme: any, context: any) {
+			return new Text(`${theme.fg(context.isError ? "error" : "success", context.isError ? "✘" : "✓")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);
 		},
 	});
 }

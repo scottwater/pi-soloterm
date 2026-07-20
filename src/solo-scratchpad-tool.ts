@@ -35,8 +35,8 @@ function resultText(result: unknown): string {
 	return mcpContentToText(mcp as any);
 }
 
-function unavailable(message: string) {
-	return { content: [{ type: "text" as const, text: message }], isError: true, details: { error: message } };
+function unavailable(message: string): never {
+	throw new Error(message);
 }
 
 export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermScratchpadDeps): void {
@@ -61,7 +61,9 @@ export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermS
 				if (action === "list") {
 					if (!has("scratchpad_list")) return unavailable("Solo scratchpad_list MCP tool is not available.");
 					const result = await deps.client.callTool("scratchpad_list", {});
-					return { content: [{ type: "text" as const, text: resultText(result) }], isError: soloToolResultIsError(result), details: { result } };
+					const text = resultText(result);
+					if (soloToolResultIsError(result)) throw new Error(text || "scratchpad_list failed.");
+					return { content: [{ type: "text" as const, text }], details: { result } };
 				}
 
 				if (action === "read") {
@@ -70,7 +72,9 @@ export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermS
 					const scratchpadId = params.scratchpadId ?? (await resolveScratchpadIdByName(deps.client, params.name!.trim()));
 					if (scratchpadId == null) return unavailable(`No Solo scratchpad found named: ${params.name}`);
 					const { result } = await readScratchpad(deps.client, scratchpadId, params.mode ?? "full");
-					return { content: [{ type: "text" as const, text: resultText(result) }], isError: soloToolResultIsError(result as any), details: { result } };
+					const text = resultText(result);
+					if (soloToolResultIsError(result as any)) throw new Error(text || "scratchpad_read failed.");
+					return { content: [{ type: "text" as const, text }], details: { result } };
 				}
 
 				if (action === "write") {
@@ -81,7 +85,9 @@ export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermS
 					const { args, error } = await buildScratchpadWriteArgs(deps.client, params);
 					if (error || !args) return unavailable(error ?? "Unable to build scratchpad_write arguments.");
 					const result = await deps.client.callTool("scratchpad_write", args);
-					return { content: [{ type: "text" as const, text: resultText(result) }], isError: soloToolResultIsError(result), details: { result } };
+					const text = resultText(result);
+					if (soloToolResultIsError(result)) throw new Error(text || "scratchpad_write failed.");
+					return { content: [{ type: "text" as const, text }], details: { result } };
 				}
 
 				return unavailable(`Unknown solo_scratchpad action: ${action || "(empty)"}`);
@@ -93,10 +99,10 @@ export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermS
 		renderCall(args: Record<string, unknown>, theme: any) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_scratchpad"))} ${theme.fg("accent", String(args.action ?? "?"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any) {
-			const icon = result.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
+		renderResult(result: any, _opts: any, theme: any, context: any) {
+			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
 			const first = String(result.content?.[0]?.text ?? "").split("\n").find((line) => line.trim()) ?? "scratchpad";
-			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_scratchpad"))} ${theme.fg(result.isError ? "error" : "dim", first.slice(0, 140))}`, 0, 0);
+			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_scratchpad"))} ${theme.fg(context.isError ? "error" : "dim", first.slice(0, 140))}`, 0, 0);
 		},
 	});
 }

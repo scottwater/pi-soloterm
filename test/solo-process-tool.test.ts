@@ -64,11 +64,12 @@ test("close refuses missing identity and reports diagnostics", async () => {
 		hasTool: (name: string) => name === "close_process",
 		callTool: async (...args: any[]) => { calls.push(args); return result({}); },
 	});
-	const response = await execute({ action: "close", processId: 12 });
-	assert.equal(response.isError, true);
-	assert.match(response.content[0].text, /project identity/);
-	assert.match(response.content[0].text, /current-process identity/);
-	assert.match(response.content[0].text, /identify_session timed out/);
+	await assert.rejects(
+		execute({ action: "close", processId: 12 }),
+		(error: Error) => /project identity/.test(error.message)
+			&& /current-process identity/.test(error.message)
+			&& /identify_session timed out/.test(error.message),
+	);
 	assert.equal(calls.length, 0);
 });
 
@@ -83,11 +84,29 @@ test("close permits explicit safety overrides and scopes close and verification"
 		},
 	});
 	const response = await execute({ action: "close", processId: 12, projectId: 7, allowCurrent: true });
-	assert.equal(response.isError, false);
+	assert.equal("isError" in response, false);
 	assert.deepEqual(calls, [
 		["close_process", { project_id: 7, process_id: 12 }],
 		["list_processes", { project_id: 7 }],
 	]);
+});
+
+test("close reports partial success when verification throws", async () => {
+	const execute = processExecutor({
+		tools: [], identity: { process_id: 99, project: { id: 7 } },
+		hasTool: (name: string) => ["close_process", "list_processes"].includes(name),
+		callTool: async (name: string) => {
+			if (name === "close_process") return result({ ok: true });
+			throw new Error("verification transport unavailable");
+		},
+	});
+
+	await assert.rejects(
+		execute({ action: "close", processId: 12 }),
+		(error: Error) => /Closed Solo process #12/.test(error.message)
+			&& /verification failed/.test(error.message)
+			&& /verification transport unavailable/.test(error.message),
+	);
 });
 
 test("close protects the identified current session unless explicitly allowed", async () => {
@@ -98,9 +117,9 @@ test("close protects the identified current session unless explicitly allowed", 
 		callTool: async (...args: any[]) => { calls.push(args); return result({ ok: true }); },
 	};
 	const execute = processExecutor(client);
-	assert.equal((await execute({ action: "close", processId: 12 })).isError, true);
+	await assert.rejects(execute({ action: "close", processId: 12 }), /Refusing to close the current Solo\/Pi process/);
 	assert.equal(calls.length, 0);
-	assert.equal((await execute({ action: "close", processId: 12, allowCurrent: true })).isError, false);
+	assert.equal("isError" in await execute({ action: "close", processId: 12, allowCurrent: true }), false);
 	assert.deepEqual(calls[0], ["close_process", { project_id: 7, process_id: 12 }]);
 });
 
@@ -121,7 +140,7 @@ test("close_subagents scopes listing and closing and excludes the current sessio
 		},
 	});
 	const response = await execute({ action: "close_subagents" });
-	assert.equal(response.isError, false);
+	assert.equal("isError" in response, false);
 	assert.deepEqual(calls, [
 		["list_processes", { project_id: 9 }],
 		["close_process", { project_id: 9, process_id: 6 }],
@@ -139,9 +158,9 @@ test("close_subagents dry run requires project scope but not current-process ide
 			return result({ processes: [{ id: 6, status: "Running", command: "pi --soloterm" }] });
 		},
 	});
-	assert.equal((await execute({ action: "close_subagents", dryRun: true })).isError, true);
+	await assert.rejects(execute({ action: "close_subagents", dryRun: true }), /project identity/);
 	const response = await execute({ action: "close_subagents", projectId: 9, dryRun: true });
-	assert.equal(response.isError, undefined);
+	assert.equal("isError" in response, false);
 	assert.match(response.content[0].text, /#6/);
 	assert.deepEqual(calls, [["list_processes", { project_id: 9 }]]);
 });
@@ -159,8 +178,9 @@ test("close_subagents requires overrides without identity and surfaces verificat
 				: { content: [{ type: "text", text: "verification unavailable" }], isError: true };
 		},
 	});
-	assert.equal((await execute({ action: "close_subagents", projectId: 9 })).isError, true);
-	const response = await execute({ action: "close_subagents", projectId: 9, allowCurrent: true });
-	assert.equal(response.isError, true);
-	assert.match(response.content[0].text, /Verification failed: verification unavailable/);
+	await assert.rejects(execute({ action: "close_subagents", projectId: 9 }), /current-process identity/);
+	await assert.rejects(
+		execute({ action: "close_subagents", projectId: 9, allowCurrent: true }),
+		/Verification failed: verification unavailable/,
+	);
 });

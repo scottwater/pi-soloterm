@@ -185,9 +185,7 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 		promptGuidelines: ["Use solo_todo when a workflow asks you to create or update checklist/task progress in SoloTerm."],
 		parameters: SoloTermTodoParams as any,
 		async execute(_toolCallId, params: SoloTermTodoArgs) {
-			if (!deps.isActive()) {
-				return { content: [{ type: "text" as const, text: "SoloTerm mode is not active." }], details: { todos, inactive: true } };
-			}
+			if (!deps.isActive()) throw new Error("SoloTerm mode is not active.");
 
 			const action = String(params.action ?? "list").trim().toLowerCase();
 			if (action === "list") {
@@ -212,7 +210,7 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 			}
 
 			if (action === "add") {
-				if (!params.title?.trim()) return { content: [{ type: "text" as const, text: "solo_todo add requires title." }], isError: true, details: { todos } };
+				if (!params.title?.trim()) throw new Error("solo_todo add requires title.");
 				const todo = normalizeTodo(params);
 				todos = [...todos, todo];
 				persist(pi, todos);
@@ -221,7 +219,7 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 			}
 
 			if (action === "update" || action === "complete") {
-				if (!params.id?.trim()) return { content: [{ type: "text" as const, text: `${action} requires id.` }], isError: true, details: { todos } };
+				if (!params.id?.trim()) throw new Error(`${action} requires id.`);
 				let found = false;
 				todos = todos.map((todo) => {
 					if (todo.id !== params.id) return todo;
@@ -235,20 +233,20 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 						notes: params.notes ?? todo.notes,
 					};
 				});
-				if (!found) return { content: [{ type: "text" as const, text: `No SoloTerm todo with id ${params.id}.` }], isError: true, details: { todos } };
+				if (!found) throw new Error(`No SoloTerm todo with id ${params.id}.`);
 				persist(pi, todos);
 				return { content: [{ type: "text" as const, text: formatTodos(todos) }], details: { backend: "session", todos } };
 			}
 
-			return { content: [{ type: "text" as const, text: `Unknown solo_todo action: ${action}` }], isError: true, details: { todos } };
+			throw new Error(`Unknown solo_todo action: ${action}`);
 		},
 		renderCall(args: Record<string, unknown>, theme: any) {
 			return new Text(`${theme.fg("accent", "☐")} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg("accent", String(args.action ?? "list"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any) {
+		renderResult(result: any, _opts: any, theme: any, context: any) {
 			const count = Array.isArray(result.details?.todos) ? result.details.todos.length : 0;
-			const icon = result.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
-			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg("dim", `${count} todos`)}`, 0, 0);
+			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
+			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg(context.isError ? "error" : "dim", context.isError ? String(result.content?.[0]?.text ?? "solo_todo failed").slice(0, 140) : `${count} todos`)}`, 0, 0);
 		},
 	});
 }

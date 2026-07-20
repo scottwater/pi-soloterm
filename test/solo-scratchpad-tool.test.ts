@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildScratchpadWriteArgs, prepareSoloTermScratchpadArgs } from "../src/solo-scratchpad-args.ts";
+import { buildScratchpadWriteArgs, prepareSoloTermScratchpadArgs, resolveScratchpadIdByName } from "../src/solo-scratchpad-args.ts";
 import type { McpToolCallResult, SoloCallToolLike } from "../src/solo-mcp-client.ts";
 
 test("prepareSoloTermScratchpadArgs accepts Solo-style snake_case aliases", () => {
@@ -23,6 +23,22 @@ test("prepareSoloTermScratchpadArgs accepts Solo-style snake_case aliases", () =
 			mode: undefined,
 		},
 	);
+});
+
+test("scratchpad name resolution reports a missing scratchpad_list helper", async () => {
+	const client: SoloCallToolLike = {
+		hasTool: () => false,
+		callTool: async () => { throw new Error("unexpected call"); },
+	};
+	await assert.rejects(resolveScratchpadIdByName(client, "artifact"), /scratchpad_list MCP tool is required/);
+});
+
+test("scratchpad name resolution preserves MCP failure diagnostics", async () => {
+	const client: SoloCallToolLike = {
+		hasTool: (name) => name === "scratchpad_list",
+		callTool: async () => ({ isError: true, content: [{ type: "text", text: "Solo scratchpads unavailable" }] }),
+	};
+	await assert.rejects(resolveScratchpadIdByName(client, "artifact"), /Solo scratchpads unavailable/);
 });
 
 test("buildScratchpadWriteArgs writes to an existing scratchpad by id", async () => {

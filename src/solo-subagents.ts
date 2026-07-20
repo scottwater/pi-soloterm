@@ -17,6 +17,19 @@ import {
 	type SoloCallToolLike,
 } from "./solo-mcp-client.ts";
 
+export type SoloTaskStatus =
+	| "completed"
+	| "timeout"
+	| "started"
+	| "failed"
+	| "no_output"
+	| "exited"
+	| "crashed"
+	| "stopped"
+	| "closed"
+	| "terminated"
+	| "dead";
+
 export interface SpawnedSoloTask {
 	id: string;
 	name: string;
@@ -25,7 +38,7 @@ export interface SpawnedSoloTask {
 	artifactScratchpadName?: string;
 	output?: string;
 	artifactContent?: string;
-	status: "completed" | "timeout" | "started" | "failed" | "no_output";
+	status: SoloTaskStatus;
 	error?: string;
 }
 
@@ -196,11 +209,45 @@ async function waitForReady(client: SoloCallToolLike, processId: number, timeout
 	}
 }
 
+interface ProcessCompletion {
+	status: SoloTaskStatus;
+	error?: string;
+}
+
+const FAILURE_PROCESS_STATUSES = new Set<SoloTaskStatus>([
+	"failed",
+	"exited",
+	"crashed",
+	"stopped",
+	"closed",
+	"terminated",
+	"dead",
+]);
+
+export function classifyTerminalProcessStatus(value: unknown): ProcessCompletion | undefined {
+	if (typeof value !== "string") return undefined;
+	const status = value.trim().toLowerCase();
+	if (!status || status === "running") return undefined;
+	if (status === "completed" || status === "complete" || status === "succeeded" || status === "success") {
+		return { status: "completed" };
+	}
+	if (FAILURE_PROCESS_STATUSES.has(status as SoloTaskStatus)) {
+		return {
+			status: status as SoloTaskStatus,
+			error: `Solo process entered terminal status "${status}".`,
+		};
+	}
+	return {
+		status: "failed",
+		error: `Solo process entered unrecognized terminal status "${status}".`,
+	};
+}
+
 async function waitForIdle(
 	client: SoloCallToolLike,
 	processId: number,
 	maxWaitMs: number,
-): Promise<"completed" | "timeout"> {
+): Promise<ProcessCompletion> {
 	const started = Date.now();
 	let sawBusy = false;
 	while (Date.now() - started < maxWaitMs) {
@@ -209,15 +256,15 @@ async function waitForIdle(
 			const data = extractStructuredOrTextJson<any>(result);
 			const state = data?.agent_state;
 			if (state?.thinking || state?.planning || state?.idle === false) sawBusy = true;
-			if (state?.idle === true && sawBusy) return "completed";
-			const status = typeof data?.status === "string" ? data.status.toLowerCase() : "";
-			if (status && status !== "running") return "completed";
+			const completion = classifyTerminalProcessStatus(data?.status);
+			if (completion) return completion;
+			if (state?.idle === true && sawBusy) return { status: "completed" };
 		} catch {
 			// Status failures may be transient while Solo starts the agent.
 		}
 		await delay(1_000);
 	}
-	return "timeout";
+	return { status: "timeout" };
 }
 
 function normalizeCapturedOutput(value: string | undefined): string | undefined {
@@ -310,7 +357,10 @@ export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec):
 	await sendInputWithRetry(client, processId, prompt);
 
 	const shouldWait = spec.wait !== false;
-	let status: SpawnedSoloTask["status"] = shouldWait ? await waitForIdle(client, processId, spec.maxWaitMs ?? 30 * 60_000) : "started";
+	const completion: ProcessCompletion = shouldWait
+		? await waitForIdle(client, processId, spec.maxWaitMs ?? 30 * 60_000)
+		: { status: "started" };
+	let status = completion.status;
 	const output = shouldWait ? await readProcessOutput(client, processId) : undefined;
 	const artifactContent = shouldWait ? await readScratchpadArtifact(client, artifact) : undefined;
 	if (shouldWait && status === "completed" && !output && !artifactContent) status = "no_output";
@@ -325,6 +375,7 @@ export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec):
 		output: output ? truncate(output, 40_000) : undefined,
 		artifactContent: artifactContent ? truncate(artifactContent, 40_000) : undefined,
 		status,
+		error: completion.error,
 	};
 }
 
@@ -334,7 +385,8 @@ export function summarizeSoloTask(result: SpawnedSoloTask): string {
 	const artifact = result.artifactScratchpadName
 		? `\nArtifact: ${result.artifactScratchpadName}${result.artifactScratchpadId != null ? ` (#${result.artifactScratchpadId})` : ""}`
 		: "";
-	const body = result.error ? `Error: ${result.error}` : result.artifactContent || result.output || "(no output captured)";
+	const captured = result.artifactContent || result.output;
+	const body = [result.error ? `Error: ${result.error}` : undefined, captured].filter(Boolean).join("\n\n") || "(no output captured)";
 	return `${title}${artifact}\n\n${body}`;
 }
 

@@ -56,6 +56,7 @@ export interface SoloTermTaskDeps {
 	isActive: () => boolean;
 	isClientReady: () => boolean;
 	getChildPiFlags?: () => string[];
+	runTask?: typeof runSoloTask;
 }
 
 function normalizeSingleTask(params: SingleTaskArgs, piFlags: string[] = ["--soloterm"]): SoloTaskSpec {
@@ -90,16 +91,17 @@ async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number
 	return results;
 }
 
-function unavailable(text: string) {
-	return {
-		content: [{ type: "text" as const, text }],
-		details: { error: text },
-	};
+function unavailable(text: string): never {
+	throw new Error(text);
 }
 
-async function runTaskSafely(client: SoloCallToolLike, spec: SoloTaskSpec): Promise<SpawnedSoloTask> {
+async function runTaskSafely(
+	runner: typeof runSoloTask,
+	client: SoloCallToolLike,
+	spec: SoloTaskSpec,
+): Promise<SpawnedSoloTask> {
 	try {
-		return await runSoloTask(client, spec);
+		return await runner(client, spec);
 	} catch (error) {
 		return {
 			id: randomUUID(),
@@ -136,19 +138,16 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 
 			const tasks = Array.isArray(params.tasks) && params.tasks.length > 0 ? params.tasks : undefined;
 			const piFlags = deps.getChildPiFlags?.() ?? ["--soloterm"];
+			const runner = deps.runTask ?? runSoloTask;
 			try {
 				if (tasks) {
-					const results = await mapWithConcurrency(tasks, params.concurrency ?? 4, async (task) => runTaskSafely(deps.client, normalizeSingleTask(task, piFlags)));
+					const results = await mapWithConcurrency(tasks, params.concurrency ?? 4, async (task) => runTaskSafely(runner, deps.client, normalizeSingleTask(task, piFlags)));
 					const succeeded = results.filter(taskSucceeded).length;
+					const summary = `Parallel SoloTerm tasks: ${succeeded}/${results.length} completed\n\n${results.map(summarizeSoloTask).join("\n\n---\n\n")}`;
+					if (succeeded !== results.length) throw new Error(summary);
 					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Parallel SoloTerm tasks: ${succeeded}/${results.length} completed\n\n${results.map(summarizeSoloTask).join("\n\n---\n\n")}`,
-							},
-						],
+						content: [{ type: "text" as const, text: summary }],
 						details: { mode: "parallel", results },
-						isError: succeeded !== results.length,
 					};
 				}
 
@@ -156,19 +155,16 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 					return unavailable("solo_task requires either a single task string or a non-empty tasks array.");
 				}
 
-				const result = await runTaskSafely(deps.client, normalizeSingleTask(params as SingleTaskArgs, piFlags));
+				const result = await runTaskSafely(runner, deps.client, normalizeSingleTask(params as SingleTaskArgs, piFlags));
+				const summary = summarizeSoloTask(result);
+				if (!taskSucceeded(result)) throw new Error(summary);
 				return {
-					content: [{ type: "text" as const, text: summarizeSoloTask(result) }],
+					content: [{ type: "text" as const, text: summary }],
 					details: { mode: "single", result },
-					isError: !taskSucceeded(result),
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				return {
-					content: [{ type: "text" as const, text: `solo_task failed: ${message}` }],
-					details: { error: message },
-					isError: true,
-				};
+				throw new Error(`solo_task failed: ${message}`);
 			}
 		},
 		renderCall(args: Record<string, any>, theme: any) {
@@ -187,12 +183,11 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 				0,
 			);
 		},
-		renderResult(result: any, _opts: any, theme: any) {
-			const isError = result.isError || result.details?.error;
-			const icon = isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
+		renderResult(result: any, _opts: any, theme: any, context: any) {
+			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
 			const text = result.content?.[0]?.text ?? "";
 			const first = String(text).split("\n").find((line) => line.trim()) ?? "solo_task";
-			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_task"))} ${theme.fg(isError ? "error" : "dim", first.slice(0, 160))}`, 0, 0);
+			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_task"))} ${theme.fg(context.isError ? "error" : "dim", first.slice(0, 160))}`, 0, 0);
 		},
 	});
 }

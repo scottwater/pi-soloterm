@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildPiExtraArgs, buildSoloTaskPrompt, resolveSoloAgentTool } from "../src/solo-subagents.ts";
+import { buildPiExtraArgs, buildSoloTaskPrompt, classifyTerminalProcessStatus, resolveSoloAgentTool } from "../src/solo-subagents.ts";
 import type { McpToolCallResult, SoloCallToolLike } from "../src/solo-mcp-client.ts";
 
 class FakeClient implements SoloCallToolLike {
@@ -17,6 +17,23 @@ class FakeClient implements SoloCallToolLike {
 		return { isError: true, content: [{ type: "text", text: "unexpected" }] };
 	}
 }
+
+test("terminal child process failures retain their Solo status", () => {
+	assert.deepEqual(classifyTerminalProcessStatus("failed"), {
+		status: "failed",
+		error: 'Solo process entered terminal status "failed".',
+	});
+	assert.deepEqual(classifyTerminalProcessStatus("Exited"), {
+		status: "exited",
+		error: 'Solo process entered terminal status "exited".',
+	});
+	assert.deepEqual(classifyTerminalProcessStatus("crashed"), {
+		status: "crashed",
+		error: 'Solo process entered terminal status "crashed".',
+	});
+	assert.equal(classifyTerminalProcessStatus("running"), undefined);
+	assert.deepEqual(classifyTerminalProcessStatus("completed"), { status: "completed" });
+});
 
 test("resolveSoloAgentTool identifies default Pi tool", async () => {
 	const client = new FakeClient([{ id: 1, name: "Pi", command: "pi", enabled: true }]);

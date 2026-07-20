@@ -58,8 +58,8 @@ interface CloseResult {
 	error?: string;
 }
 
-function unavailable(message: string) {
-	return { content: [{ type: "text" as const, text: message }], isError: true, details: { error: message } };
+function unavailable(message: string): never {
+	throw new Error(message);
 }
 
 function coerceNumber(value: unknown): number | undefined {
@@ -245,7 +245,9 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					if (!has("get_process_status")) return unavailable("Solo get_process_status MCP tool is not available.");
 					if (params.processId == null) return unavailable("solo_process status requires processId.");
 					const result = await deps.client.callTool("get_process_status", { ...scopedArgs(projectId), process_id: params.processId });
-					return { content: [{ type: "text" as const, text: resultToText(result) }], isError: soloToolResultIsError(result), details: { result } };
+					const text = resultToText(result);
+					if (soloToolResultIsError(result)) throw new Error(text || "get_process_status failed.");
+					return { content: [{ type: "text" as const, text }], details: { result } };
 				}
 
 				if (action === "output") {
@@ -253,7 +255,9 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					if (!has(tool)) return unavailable(`Solo ${tool} MCP tool is not available.`);
 					if (params.processId == null) return unavailable("solo_process output requires processId.");
 					const result = await deps.client.callTool(tool, { ...scopedArgs(projectId), process_id: params.processId, lines: params.lines ?? 200 });
-					return { content: [{ type: "text" as const, text: mcpContentToText(result) || resultToText(result) }], isError: soloToolResultIsError(result), details: { result } };
+					const text = mcpContentToText(result) || resultToText(result);
+					if (soloToolResultIsError(result)) throw new Error(text || `${tool} failed.`);
+					return { content: [{ type: "text" as const, text }], details: { result } };
 				}
 
 				if (action === "close") {
@@ -269,14 +273,18 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					const result = await closeOne(deps.client, process, projectId);
 					let verificationError: string | undefined;
 					if (result.ok && has("list_processes")) {
-						const verification = await listProcesses(deps.client, projectId);
-						if (soloToolResultIsError(verification.result)) verificationError = `close verification failed: ${resultToText(verification.result) || "list_processes failed"}`;
-						else if (verification.processes.some((item) => processIdOf(item) === params.processId && isActiveProcess(item))) verificationError = "close verification failed: process is still active";
+						try {
+							const verification = await listProcesses(deps.client, projectId);
+							if (soloToolResultIsError(verification.result)) verificationError = resultToText(verification.result) || "list_processes failed";
+							else if (verification.processes.some((item) => processIdOf(item) === params.processId && isActiveProcess(item))) verificationError = "process is still active";
+						} catch (error) {
+							verificationError = error instanceof Error ? error.message : String(error);
+						}
 					}
-					const error = result.error ?? verificationError;
+					if (!result.ok) throw new Error(`Failed to close Solo process #${params.processId}: ${result.error ?? "unknown close error"}`);
+					if (verificationError) throw new Error(`Closed Solo process #${params.processId}, but verification failed: ${verificationError}`);
 					return {
-						content: [{ type: "text" as const, text: result.ok && !verificationError ? `Closed Solo process #${params.processId}.` : `Failed to close Solo process #${params.processId}: ${error}` }],
-						isError: !result.ok || Boolean(verificationError),
+						content: [{ type: "text" as const, text: `Closed Solo process #${params.processId}.` }],
 						details: { projectId, result, verificationError },
 					};
 				}
@@ -307,10 +315,10 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 					if (remaining?.length) verificationError = `${remaining.length} matching process${remaining.length === 1 ? " remains" : "es remain"} active`;
 					const failed = results.some((closeResult) => !closeResult.ok) || Boolean(verificationError);
 					const summary = `${summarizeCloseResults(targets, results, remaining)}${verificationError ? `\n\nVerification failed: ${verificationError}` : ""}`;
+					if (failed) throw new Error(summary);
 					return {
 						content: [{ type: "text" as const, text: summary }],
-						isError: failed,
-						details: { projectId, closed: results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)), failed: results.filter((closeResult) => !closeResult.ok), remaining, verificationError },
+						details: { projectId, closed: results.filter((closeResult) => closeResult.ok).map((closeResult) => processIdOf(closeResult.process)), failed: [], remaining, verificationError },
 					};
 				}
 
@@ -323,10 +331,10 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 		renderCall(args: Record<string, unknown>, theme: any) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_process"))} ${theme.fg("accent", String(args.action ?? "list"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any) {
-			const icon = result.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
+		renderResult(result: any, _opts: any, theme: any, context: any) {
+			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
 			const first = String(result.content?.[0]?.text ?? "").split("\n").find((line) => line.trim()) ?? "solo_process";
-			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_process"))} ${theme.fg(result.isError ? "error" : "dim", first.slice(0, 160))}`, 0, 0);
+			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_process"))} ${theme.fg(context.isError ? "error" : "dim", first.slice(0, 160))}`, 0, 0);
 		},
 	});
 }
