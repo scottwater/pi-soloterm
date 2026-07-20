@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -11,21 +12,35 @@ import {
 const TODO_STATE_ENTRY = "solo-todos";
 
 type TodoStatus = "pending" | "in_progress" | "completed";
+type TodoPriority = "low" | "medium" | "high";
 
 export interface SoloTermTodoItem {
 	id: string;
 	title: string;
 	status: TodoStatus;
-	priority?: "low" | "medium" | "high";
+	priority?: TodoPriority;
 	tags?: string[];
 	notes?: string;
 }
 
-interface TodoStateEntry {
+interface StoredTodoItem extends SoloTermTodoItem {
+	/** Private Solo mirror identity; never included in tool result content/details. */
+	soloTodoId?: number;
+}
+
+interface TodoStateEntryV1 {
 	version: 1;
-	todos: SoloTermTodoItem[];
+	todos: StoredTodoItem[];
 	updatedAt: string;
 }
+
+interface TodoStateEntryV2 {
+	version: 2;
+	todos: StoredTodoItem[];
+	updatedAt: string;
+}
+
+type TodoStateEntry = TodoStateEntryV1 | TodoStateEntryV2;
 
 const TodoItemSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable todo id. Generated when omitted." })),
@@ -39,10 +54,10 @@ const TodoItemSchema = Type.Object({
 const SoloTermTodoParams = Type.Object({
 	action: Type.String({
 		description:
-			"Todo operation: write replaces the tracked list, list shows todos, add creates one todo, update changes one todo, complete marks one todo complete, clear removes fallback todos.",
+			"Todo operation: write replaces the tracked list, list shows todos, add creates one todo, update changes one todo, complete marks one todo complete, clear removes local todos only.",
 	}),
 	items: Type.Optional(Type.Array(TodoItemSchema, { description: "Full todo list for action=write." })),
-	id: Type.Optional(Type.String({ description: "Todo id for update/complete." })),
+	id: Type.Optional(Type.String({ description: "Local todo id for update/complete." })),
 	title: Type.Optional(Type.String({ description: "Todo title for add/update." })),
 	status: Type.Optional(Type.String({ description: "pending, in_progress, or completed." })),
 	priority: Type.Optional(Type.String({ description: "low, medium, or high." })),
@@ -58,6 +73,11 @@ export interface SoloTermTodoDeps {
 	isClientReady: () => boolean;
 }
 
+interface MirrorReport {
+	attempted: number;
+	diagnostics: string[];
+}
+
 function normalizeStatus(value: unknown): TodoStatus {
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
 	if (normalized === "in_progress" || normalized === "in-progress" || normalized === "active") return "in_progress";
@@ -65,40 +85,81 @@ function normalizeStatus(value: unknown): TodoStatus {
 	return "pending";
 }
 
-function normalizePriority(value: unknown): SoloTermTodoItem["priority"] {
+function normalizePriority(value: unknown): TodoPriority | undefined {
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
 	if (normalized === "low" || normalized === "medium" || normalized === "high") return normalized;
 	return undefined;
 }
 
-function makeId(title: string): string {
-	return `${Date.now().toString(36)}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "todo"}`;
+function makeId(_title: string): string {
+	return `todo-${randomUUID()}`;
 }
 
-function normalizeTodo(input: any): SoloTermTodoItem {
+function normalizeTodo(input: any, fallbackId?: string): StoredTodoItem {
 	const title = String(input?.title ?? "").trim();
+	const parsedSoloId = typeof input?.soloTodoId === "number" ? input.soloTodoId : Number(input?.soloTodoId);
 	return {
-		id: String(input?.id ?? makeId(title)),
+		id: input?.id == null ? (fallbackId ?? makeId(title)) : String(input.id).trim(),
 		title,
 		status: normalizeStatus(input?.status),
 		priority: normalizePriority(input?.priority),
-		tags: Array.isArray(input?.tags) ? input.tags.filter((tag: unknown): tag is string => typeof tag === "string" && tag.trim().length > 0) : undefined,
+		tags: Array.isArray(input?.tags)
+			? input.tags.filter((tag: unknown): tag is string => typeof tag === "string" && tag.trim().length > 0)
+			: undefined,
 		notes: typeof input?.notes === "string" ? input.notes : undefined,
+		...(Number.isSafeInteger(parsedSoloId) && parsedSoloId > 0 ? { soloTodoId: parsedSoloId } : {}),
 	};
+}
+
+function normalizePublicTodo(input: unknown): SoloTermTodoItem {
+	const { soloTodoId: _ignored, ...todo } = normalizeTodo(input);
+	return todo;
+}
+
+function normalizeWriteTodos(inputs: readonly unknown[]): SoloTermTodoItem[] {
+	const used = new Set<string>();
+	return inputs.map((input, index) => {
+		const suppliedId = (input as { id?: unknown } | null)?.id;
+		if (suppliedId !== undefined && String(suppliedId).trim().length === 0) {
+			throw new Error(`solo_todo write item ${index + 1} id must be non-empty.`);
+		}
+		const todo = normalizePublicTodo(input);
+		if (used.has(todo.id)) throw new Error(`solo_todo write requires unique ids; duplicate id "${todo.id}".`);
+		used.add(todo.id);
+		return todo;
+	});
+}
+
+function sanitizeReconstructedTodos(inputs: readonly unknown[]): StoredTodoItem[] {
+	const used = new Set<string>();
+	return inputs
+		.map((input, index) => normalizeTodo(input, `legacy-todo-${index + 1}`))
+		.filter((todo) => todo.title)
+		.map((todo, index) => {
+			let id = todo.id;
+			if (!id || used.has(id)) {
+				const base = `legacy-todo-${index + 1}`;
+				id = base;
+				let suffix = 2;
+				while (used.has(id)) id = `${base}-${suffix++}`;
+			}
+			used.add(id);
+			return { ...todo, id };
+		});
 }
 
 function normalizeEntryData(value: unknown): TodoStateEntry | null {
 	if (!value || typeof value !== "object") return null;
 	const record = value as Partial<TodoStateEntry>;
-	if (record.version !== 1 || !Array.isArray(record.todos)) return null;
+	if ((record.version !== 1 && record.version !== 2) || !Array.isArray(record.todos)) return null;
 	return {
-		version: 1,
-		todos: record.todos.map(normalizeTodo).filter((todo) => todo.title),
+		version: record.version,
+		todos: sanitizeReconstructedTodos(record.todos),
 		updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date(0).toISOString(),
 	};
 }
 
-function reconstructTodos(entries: readonly unknown[]): SoloTermTodoItem[] {
+function reconstructTodos(entries: readonly unknown[]): StoredTodoItem[] {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i] as { type?: string; customType?: string; data?: unknown } | undefined;
 		if (entry?.type !== "custom" || entry.customType !== TODO_STATE_ENTRY) continue;
@@ -119,58 +180,156 @@ function formatTodos(todos: readonly SoloTermTodoItem[]): string {
 		.join("\n");
 }
 
-function persist(pi: ExtensionAPI, todos: SoloTermTodoItem[]): void {
-	pi.appendEntry<TodoStateEntry>(TODO_STATE_ENTRY, { version: 1, todos, updatedAt: new Date().toISOString() });
+function persist(pi: ExtensionAPI, todos: StoredTodoItem[]): void {
+	pi.appendEntry<TodoStateEntryV2>(TODO_STATE_ENTRY, { version: 2, todos, updatedAt: new Date().toISOString() });
 }
 
-function soloTodosAvailable(client: SoloCallToolLike): boolean {
-	return client.hasTool("todo_create") && client.hasTool("todo_list") && client.hasTool("todo_update") && client.hasTool("todo_complete");
+function extractSoloTodoId(result: unknown): number | undefined {
+	const data = extractStructuredOrTextJson<any>(result as any);
+	const value = data?.todo_id ?? data?.id ?? data?.todo?.todo_id ?? data?.todo?.id;
+	const id = typeof value === "number" ? value : Number(value);
+	return Number.isSafeInteger(id) && id > 0 ? id : undefined;
 }
 
-function extractSoloTodos(result: any): any[] {
-	const data = extractStructuredOrTextJson<any>(result);
-	if (Array.isArray(data)) return data;
-	if (Array.isArray(data?.todos)) return data.todos;
-	return [];
+function mirrorError(operation: string, resultOrError: unknown): string {
+	if (resultOrError instanceof Error) return `${operation}: ${resultOrError.message}`;
+	const text = mcpContentToText(resultOrError as any);
+	return `${operation}: ${text || "Solo returned an error"}`;
 }
 
-async function listSoloTodos(client: SoloCallToolLike): Promise<string | undefined> {
-	const result = await client.callTool("todo_list", { tags: ["solo"] });
-	if (soloToolResultIsError(result)) return undefined;
-	const todos = extractSoloTodos(result);
-	if (!todos.length) return mcpContentToText(result) || "No Solo SoloTerm todos.";
-	return todos
-		.map((todo: any) => {
-			const id = todo.id ?? todo.todo_id ?? "?";
-			const title = todo.title ?? todo.text ?? todo.name ?? JSON.stringify(todo);
-			const done = todo.completed === true || todo.status === "completed" ? "[x]" : "[ ]";
-			return `${done} ${id} — ${title}`;
-		})
-		.join("\n");
+function redactPrivateBinding(message: string, todo: StoredTodoItem): string {
+	if (todo.soloTodoId === undefined) return message;
+	return message.replace(new RegExp(`\\b${todo.soloTodoId}\\b`, "g"), "[private Solo binding]");
 }
 
-async function mirrorToSolo(client: SoloCallToolLike, todos: SoloTermTodoItem[]): Promise<void> {
-	if (!soloTodosAvailable(client)) return;
-	for (const todo of todos) {
-		try {
-			const created = await client.callTool("todo_create", {
-				title: todo.title,
-				priority: todo.priority,
-				tags: ["solo", ...(todo.tags ?? [])],
-			});
-			if (soloToolResultIsError(created)) continue;
-			const data = extractStructuredOrTextJson<any>(created);
-			const soloId = data?.todo_id ?? data?.id ?? data?.todo?.id;
-			if (soloId != null && todo.status === "completed") await client.callTool("todo_complete", { todo_id: soloId, completed: true });
-			else if (soloId != null && todo.status === "in_progress") await client.callTool("todo_update", { todo_id: soloId, status: "in_progress" });
-		} catch {
-			// Fallback state remains authoritative if Solo todo mirroring fails.
+function createArgs(todo: StoredTodoItem): Record<string, unknown> {
+	return {
+		title: todo.title,
+		...(todo.notes !== undefined ? { body: todo.notes } : {}),
+		...(todo.priority !== undefined ? { priority: todo.priority } : {}),
+		tags: ["solo", ...(todo.tags ?? [])],
+		response_mode: "slim",
+	};
+}
+
+function updateArgs(todo: StoredTodoItem, includeStatus = true): Record<string, unknown> {
+	return {
+		todo_id: todo.soloTodoId,
+		title: todo.title,
+		body: todo.notes ?? "",
+		...(todo.priority !== undefined ? { priority: todo.priority } : {}),
+		tags: ["solo", ...(todo.tags ?? [])],
+		...(includeStatus ? { status: todo.status === "pending" ? "open" : todo.status } : {}),
+		response_mode: "slim",
+	};
+}
+
+async function callMirror(
+	client: SoloCallToolLike,
+	name: string,
+	args: Record<string, unknown>,
+	report: MirrorReport,
+	todo: StoredTodoItem,
+): Promise<any | undefined> {
+	report.attempted++;
+	const identity = `local todo ${todo.id}`;
+	try {
+		const result = await client.callTool(name, args);
+		if (soloToolResultIsError(result)) {
+			report.diagnostics.push(redactPrivateBinding(`${identity}: ${mirrorError(name, result)}`, todo));
+			return undefined;
 		}
+		return result;
+	} catch (error) {
+		report.diagnostics.push(redactPrivateBinding(`${identity}: ${mirrorError(name, error)}`, todo));
+		return undefined;
 	}
 }
 
+function canAttemptTool(client: SoloCallToolLike, name: string): boolean {
+	return client.hasTool(name) || client.canAttemptTool?.(name) === true;
+}
+
+async function syncBoundTodo(client: SoloCallToolLike, todo: StoredTodoItem, report: MirrorReport): Promise<void> {
+	if (todo.soloTodoId === undefined) return;
+	if (todo.status === "completed") {
+		if (canAttemptTool(client, "todo_update")) await callMirror(client, "todo_update", updateArgs(todo, false), report, todo);
+		else report.diagnostics.push(`local todo ${todo.id}: todo_update is unavailable; metadata remains local only`);
+		if (canAttemptTool(client, "todo_complete")) {
+			await callMirror(client, "todo_complete", {
+				todo_id: todo.soloTodoId,
+				completed: true,
+				response_mode: "slim",
+			}, report, todo);
+		} else {
+			report.diagnostics.push(`local todo ${todo.id}: todo_complete is unavailable; completion remains local only`);
+		}
+		return;
+	}
+	if (!canAttemptTool(client, "todo_update")) {
+		report.diagnostics.push(`local todo ${todo.id}: todo_update is unavailable; changes remain local only`);
+		return;
+	}
+	await callMirror(client, "todo_update", updateArgs(todo), report, todo);
+}
+
+async function createMirror(
+	client: SoloCallToolLike,
+	todo: StoredTodoItem,
+	report: MirrorReport,
+	onBound: () => void,
+): Promise<void> {
+	if (!canAttemptTool(client, "todo_create")) {
+		report.diagnostics.push("todo_create is unavailable; todo remains local only");
+		return;
+	}
+	const result = await callMirror(client, "todo_create", createArgs(todo), report, todo);
+	if (!result) return;
+	const soloTodoId = extractSoloTodoId(result);
+	if (soloTodoId === undefined) {
+		report.diagnostics.push(`local todo ${todo.id}: todo_create returned no usable todo_id; binding was not recorded and the Solo mirror may be orphaned`);
+		return;
+	}
+	todo.soloTodoId = soloTodoId;
+	// Make the new identity durable before any status/complete follow-up can fail.
+	onBound();
+	if (todo.status !== "pending") await syncBoundTodo(client, todo, report);
+}
+
+async function reconcileTodos(
+	client: SoloCallToolLike,
+	todos: StoredTodoItem[],
+	onBound: () => void,
+): Promise<MirrorReport> {
+	const report: MirrorReport = { attempted: 0, diagnostics: [] };
+	for (const todo of todos) {
+		if (todo.soloTodoId === undefined) await createMirror(client, todo, report, onBound);
+		else await syncBoundTodo(client, todo, report);
+	}
+	return report;
+}
+
+function publicTodos(todos: readonly StoredTodoItem[]): SoloTermTodoItem[] {
+	return todos.map(({ soloTodoId: _private, ...todo }) => todo);
+}
+
+function resultText(todos: readonly StoredTodoItem[], report?: MirrorReport): string {
+	const formatted = formatTodos(todos);
+	if (!report?.diagnostics.length) return formatted;
+	return `${formatted}\n\nMirror warnings:\n${report.diagnostics.map((diagnostic) => `- ${diagnostic}`).join("\n")}`;
+}
+
+function details(todos: StoredTodoItem[], report?: MirrorReport): Record<string, unknown> {
+	const mirrored = report !== undefined && report.attempted > 0 && report.diagnostics.length === 0;
+	return {
+		backend: mirrored ? "solo+session" : "session",
+		todos: publicTodos(todos),
+		...(report?.diagnostics.length ? { diagnostics: report.diagnostics } : {}),
+	};
+}
+
 export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDeps): void {
-	let todos: SoloTermTodoItem[] = [];
+	let todos: StoredTodoItem[] = [];
 
 	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
 		todos = reconstructTodos(ctx.sessionManager.getBranch());
@@ -179,8 +338,7 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 	pi.registerTool<typeof SoloTermTodoParams, Record<string, unknown>>({
 		name: "solo_todo",
 		label: "SoloTerm Todo",
-		description:
-			"Track SoloTerm workflow tasks. Uses Solo todos when available and Pi session state as a fallback.",
+		description: "Track SoloTerm workflow tasks. Pi session state is authoritative and mirrors to Solo when available.",
 		promptSnippet: "Track SoloTerm checklist/task progress.",
 		promptGuidelines: ["Use solo_todo when a workflow asks you to create or update checklist/task progress in SoloTerm."],
 		parameters: SoloTermTodoParams,
@@ -189,53 +347,77 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 
 			const action = String(params.action ?? "list").trim().toLowerCase();
 			if (action === "list") {
-				if (deps.isClientReady() && soloTodosAvailable(deps.client)) {
-					const soloList = await listSoloTodos(deps.client);
-					if (soloList) return { content: [{ type: "text" as const, text: soloList }], details: { backend: "solo", todos } };
-				}
-				return { content: [{ type: "text" as const, text: formatTodos(todos) }], details: { backend: "session", todos } };
+				return { content: [{ type: "text" as const, text: formatTodos(todos) }], details: details(todos) };
 			}
 
 			if (action === "write") {
-				todos = Array.isArray(params.items) ? params.items.map(normalizeTodo).filter((todo) => todo.title) : [];
+				const previousTodos = todos;
+				const bindings = new Map(previousTodos.flatMap((todo) => todo.soloTodoId === undefined ? [] : [[todo.id, todo.soloTodoId] as const]));
+				todos = normalizeWriteTodos(Array.isArray(params.items) ? params.items : [])
+					.filter((todo) => todo.title)
+					.map((todo) => ({ ...todo, ...(bindings.has(todo.id) ? { soloTodoId: bindings.get(todo.id) } : {}) }));
+				// Record authoritative local state before any remote I/O; persist again below
+				// because reconciliation may add a Solo binding.
 				persist(pi, todos);
-				if (deps.isClientReady()) await mirrorToSolo(deps.client, todos);
-				return { content: [{ type: "text" as const, text: formatTodos(todos) }], details: { backend: soloTodosAvailable(deps.client) ? "solo+session" : "session", todos } };
+				const report = deps.isClientReady()
+					? await reconcileTodos(deps.client, todos, () => persist(pi, todos))
+					: { attempted: 0, diagnostics: ["Solo client is not ready; todos remain local only"] };
+				const retainedIds = new Set(todos.map((todo) => todo.id));
+				const removedMirrors = previousTodos.filter((todo) => todo.soloTodoId !== undefined && !retainedIds.has(todo.id));
+				if (removedMirrors.length) {
+					report.diagnostics.push(`write removed local todo(s), but their Solo mirrors were not deleted: ${removedMirrors.map((todo) => todo.id).join(", ")}`);
+				}
+				persist(pi, todos);
+				return { content: [{ type: "text" as const, text: resultText(todos, report) }], details: details(todos, report) };
 			}
 
 			if (action === "clear") {
 				todos = [];
 				persist(pi, todos);
-				return { content: [{ type: "text" as const, text: "Cleared SoloTerm fallback todos." }], details: { backend: "session", todos } };
+				const diagnostic = "Cleared authoritative Pi session todos only; existing Solo mirrors were not deleted.";
+				return { content: [{ type: "text" as const, text: diagnostic }], details: { backend: "session", todos, diagnostics: [diagnostic] } };
 			}
 
 			if (action === "add") {
 				if (!params.title?.trim()) throw new Error("solo_todo add requires title.");
-				const todo = normalizeTodo(params);
+				if (params.id !== undefined && !params.id.trim()) throw new Error("solo_todo add id must be non-empty.");
+				let todo = normalizePublicTodo(params);
+				if (params.id !== undefined && todos.some((existing) => existing.id === todo.id)) {
+					throw new Error(`solo_todo add requires a unique id; duplicate id "${todo.id}".`);
+				}
+				while (todos.some((existing) => existing.id === todo.id)) todo = { ...todo, id: makeId(todo.title) };
 				todos = [...todos, todo];
+				// Persist before mirroring so a slow or interrupted remote call cannot erase
+				// the authoritative local addition. Persist again to save any new binding.
 				persist(pi, todos);
-				if (deps.isClientReady()) await mirrorToSolo(deps.client, [todo]);
-				return { content: [{ type: "text" as const, text: formatTodos(todos) }], details: { backend: "session", todos } };
+				const report = deps.isClientReady()
+					? await reconcileTodos(deps.client, [todo], () => persist(pi, todos))
+					: { attempted: 0, diagnostics: ["Solo client is not ready; todo remains local only"] };
+				persist(pi, todos);
+				return { content: [{ type: "text" as const, text: resultText(todos, report) }], details: details(todos, report) };
 			}
 
 			if (action === "update" || action === "complete") {
 				if (!params.id?.trim()) throw new Error(`${action} requires id.`);
-				let found = false;
-				todos = todos.map((todo) => {
-					if (todo.id !== params.id) return todo;
-					found = true;
-					return {
-						...todo,
-						title: params.title?.trim() || todo.title,
-						status: action === "complete" ? "completed" : params.status ? normalizeStatus(params.status) : todo.status,
-						priority: params.priority ? normalizePriority(params.priority) : todo.priority,
-						tags: params.tags ?? todo.tags,
-						notes: params.notes ?? todo.notes,
-					};
-				});
-				if (!found) throw new Error(`No SoloTerm todo with id ${params.id}.`);
+				const index = todos.findIndex((todo) => todo.id === params.id);
+				if (index < 0) throw new Error(`No SoloTerm todo with id ${params.id}.`);
+				const current = todos[index]!;
+				const updated: StoredTodoItem = {
+					...current,
+					title: params.title?.trim() || current.title,
+					status: action === "complete" ? "completed" : params.status ? normalizeStatus(params.status) : current.status,
+					priority: params.priority ? normalizePriority(params.priority) : current.priority,
+					tags: params.tags ?? current.tags,
+					notes: params.notes ?? current.notes,
+				};
+				todos = todos.map((todo, todoIndex) => todoIndex === index ? updated : todo);
+				// Keep the local source of truth durable before attempting its Solo mirror.
 				persist(pi, todos);
-				return { content: [{ type: "text" as const, text: formatTodos(todos) }], details: { backend: "session", todos } };
+				const report: MirrorReport = { attempted: 0, diagnostics: [] };
+				if (!deps.isClientReady()) report.diagnostics.push("Solo client is not ready; change remains local only");
+				else if (updated.soloTodoId === undefined) report.diagnostics.push("Todo has no Solo binding; change remains local only");
+				else await syncBoundTodo(deps.client, updated, report);
+				return { content: [{ type: "text" as const, text: resultText(todos, report) }], details: details(todos, report) };
 			}
 
 			throw new Error(`Unknown solo_todo action: ${action}`);
@@ -245,12 +427,15 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 		},
 		renderResult(result, _opts, theme, context) {
 			const count = Array.isArray(result.details.todos) ? result.details.todos.length : 0;
-			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
+			const warnings = Array.isArray(result.details.diagnostics) ? result.details.diagnostics.length : 0;
+			const state = context.isError ? "error" : warnings > 0 ? "warning" : "success";
+			const icon = theme.fg(state, context.isError ? "✘" : warnings > 0 ? "⚠" : "✓");
 			const content = result.content[0];
 			const errorText = content?.type === "text" ? content.text : "solo_todo failed";
-			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg(context.isError ? "error" : "dim", context.isError ? errorText.slice(0, 140) : `${count} todos`)}`, 0, 0);
+			const summary = context.isError ? errorText.slice(0, 140) : warnings > 0 ? `${count} todos · ${warnings} mirror warning${warnings === 1 ? "" : "s"}` : `${count} todos`;
+			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg(context.isError ? "error" : warnings > 0 ? "warning" : "dim", summary)}`, 0, 0);
 		},
 	});
 }
 
-export const __test__ = { formatTodos, normalizeTodo, reconstructTodos, TODO_STATE_ENTRY };
+export const __test__ = { formatTodos, makeId, normalizeTodo, reconstructTodos, TODO_STATE_ENTRY };

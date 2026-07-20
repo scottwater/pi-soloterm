@@ -307,7 +307,10 @@ export class SoloMcpClient implements SoloCallToolLike {
 	}
 
 	canAttemptTool(name: string): boolean {
-		return this.hasTool(name) || (!this.stopped && !this.child);
+		// During warm-up the transport exists before the catalog does. An
+		// authoritative call can safely join ensurePromise and decide against the
+		// loaded catalog instead of treating the temporarily empty tools list as final.
+		return this.hasTool(name) || (!this.stopped && (!this.child || this.ensurePromise !== undefined));
 	}
 
 	getTool(name: string): McpToolDef | undefined {
