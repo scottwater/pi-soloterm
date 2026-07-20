@@ -54,7 +54,7 @@ const TodoItemSchema = Type.Object({
 const SoloTermTodoParams = Type.Object({
 	action: Type.String({
 		description:
-			"Todo operation: write replaces the tracked list, list shows todos, add creates one todo, update changes one todo, complete marks one todo complete, clear removes local todos only.",
+			"Todo operation: write replaces the tracked list, list shows the authoritative local list (never queries Solo), add creates one todo, update changes one todo, complete marks one todo complete, clear removes local todos only.",
 	}),
 	items: Type.Optional(Type.Array(TodoItemSchema, { description: "Full todo list for action=write." })),
 	id: Type.Optional(Type.String({ description: "Local todo id for update/complete." })),
@@ -338,7 +338,7 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 	pi.registerTool<typeof SoloTermTodoParams, Record<string, unknown>>({
 		name: "solo_todo",
 		label: "SoloTerm Todo",
-		description: "Track SoloTerm workflow tasks. Pi session state is authoritative and mirrors to Solo when available.",
+		description: "Track SoloTerm workflow tasks. Pi session state is authoritative and mirrors to Solo when available; list shows the local authoritative state, not Solo's.",
 		promptSnippet: "Track SoloTerm checklist/task progress.",
 		promptGuidelines: ["Use solo_todo when a workflow asks you to create or update checklist/task progress in SoloTerm."],
 		parameters: SoloTermTodoParams,

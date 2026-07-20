@@ -15,7 +15,7 @@ If running under Pi, detected by `PI_CODING_AGENT=true`, use the focused `pi-sol
 - `solo_task` — spawn Solo-managed coding agents/processes and send their initial prompts. For parallel work, use one call with `tasks: [...]`.
 - `solo_process` — list processes, inspect status, read output, send input, and close processes.
 - `solo_scratchpad` — list, read, or write Solo scratchpads.
-- `solo_todo` — manage Solo todos when available, with Pi session fallback.
+- `solo_todo` — track todos in authoritative Pi session state, mirrored to Solo when available; `list` shows the local state, not Solo's.
 
 Call `solo_status` first. If it reports ready, proceed with the relevant `solo_*` tool.
 
