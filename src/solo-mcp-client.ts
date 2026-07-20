@@ -206,7 +206,7 @@ function defaultSpawn(command: string, args: string[], options: Parameters<SoloM
 export class SoloMcpClient implements SoloCallToolLike {
 	private readonly helperPath: string;
 	private readonly appDataDir: string;
-	private readonly soloProcessId?: string;
+	private readonly soloProcessId?: number;
 	private readonly clientName: string;
 	private readonly clientVersion: string;
 	private readonly idleCloseMs: number;
@@ -240,7 +240,11 @@ export class SoloMcpClient implements SoloCallToolLike {
 	constructor(options: SoloMcpClientOptions = {}) {
 		this.helperPath = options.helperPath ?? process.env.SOLO_MCP_HELPER ?? DEFAULT_SOLO_MCP_HELPER;
 		this.appDataDir = options.appDataDir ?? process.env.SOLOTERM_APP_DATA_DIR ?? DEFAULT_SOLO_APP_DATA_DIR;
-		this.soloProcessId = options.soloProcessId ?? process.env.SOLO_PROCESS_ID;
+		const soloProcessId = options.soloProcessId ?? process.env.SOLO_PROCESS_ID;
+		const parsedSoloProcessId = soloProcessId?.trim() ? Number(soloProcessId) : undefined;
+		// Process IDs are positive integers. Invalid environment values are omitted
+		// rather than allowing JSON.stringify to silently turn NaN into null.
+		this.soloProcessId = Number.isSafeInteger(parsedSoloProcessId) && (parsedSoloProcessId ?? 0) > 0 ? parsedSoloProcessId : undefined;
 		this.clientName = options.clientName ?? "pi-soloterm";
 		this.clientVersion = options.clientVersion ?? "0.1.0";
 		this.idleCloseMs = options.idleCloseMs ?? 5_000;
@@ -399,7 +403,8 @@ export class SoloMcpClient implements SoloCallToolLike {
 
 	private spawnChild(): void {
 		const env: NodeJS.ProcessEnv = { ...process.env, SOLOTERM_APP_DATA_DIR: this.appDataDir };
-		if (this.soloProcessId) env.SOLO_PROCESS_ID = this.soloProcessId;
+		delete env.SOLO_PROCESS_ID;
+		if (this.soloProcessId !== undefined) env.SOLO_PROCESS_ID = String(this.soloProcessId);
 
 		const child = this.spawnTransport(this.helperPath, [], { stdio: ["pipe", "pipe", "pipe"], env });
 		this.child = child;
@@ -477,7 +482,7 @@ export class SoloMcpClient implements SoloCallToolLike {
 			return;
 		}
 		try {
-			const args = name === "identify_session" && this.soloProcessId ? { solo_process_id: Number(this.soloProcessId) } : {};
+			const args = name === "identify_session" && this.soloProcessId !== undefined ? { solo_process_id: this.soloProcessId } : {};
 			const result = await this.request<McpToolCallResult>("tools/call", { name, arguments: args });
 			if (soloToolResultIsError(result)) {
 				this.identityError = mcpContentToText(result) || `${name} returned an error`;

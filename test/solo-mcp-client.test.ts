@@ -102,6 +102,42 @@ test("SoloMcpClient handshakes, lists catalog, and calls tools with fake helper"
 	assert.equal(helper.killed, true);
 });
 
+test("identify_session includes only a valid numeric SOLO_PROCESS_ID", async (t) => {
+	for (const scenario of [
+		{ label: "numeric", value: "42", expected: { solo_process_id: 42 }, expectedEnv: "42" },
+		{ label: "absent", value: "", expected: {}, expectedEnv: undefined },
+		{ label: "invalid", value: "not-a-process-id", expected: {}, expectedEnv: undefined },
+	] as const) {
+		await t.test(scenario.label, async () => {
+			let helper!: FakeSoloHelper;
+			let spawnedEnv!: NodeJS.ProcessEnv;
+			const client = new SoloMcpClient({
+				helperPath: "/fake/mcp",
+				exists: () => true,
+				idleCloseMs: 0,
+				soloProcessId: scenario.value,
+				spawn: (_command, _args, options) => {
+					spawnedEnv = options.env;
+					helper = new FakeSoloHelper({
+						initialize: () => ({ protocolVersion: "2024-11-05" }),
+						"tools/list": () => ({ tools: [{ name: "identify_session" }] }),
+						"tools/call": () => ({ structuredContent: { process_id: 7 } }),
+					});
+					return helper as any;
+				},
+			});
+
+			await client.start();
+			const identify = helper.requests.find(
+				(request) => request.method === "tools/call" && (request.params as any)?.name === "identify_session",
+			);
+			assert.deepEqual((identify?.params as any)?.arguments, scenario.expected);
+			assert.equal(spawnedEnv.SOLO_PROCESS_ID, scenario.expectedEnv);
+			client.stop();
+		});
+	}
+});
+
 test("an authoritative call during warm-up waits for handshake and catalog loading", async () => {
 	let helper!: FakeSoloHelper;
 	let initialized = false;
@@ -140,6 +176,80 @@ test("an authoritative call during warm-up waits for handshake and catalog loadi
 	assert.equal(mcpContentToText(await operation), "ready");
 	await warming;
 	assert.equal(client.hasTool("echo"), true);
+	client.stop();
+});
+
+test("idle close is followed by a lazy reconnect", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const helpers: FakeSoloHelper[] = [];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 25,
+		spawn: () => {
+			const helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "echo" }] }),
+				"tools/call": () => ({ content: [{ type: "text", text: "reconnected" }] }),
+			});
+			helpers.push(helper);
+			return helper as any;
+		},
+	});
+
+	await client.start();
+	t.mock.timers.tick(25);
+	assert.equal(helpers[0]?.killed, true);
+	assert.equal(client.state, "stopped");
+
+	const result = await client.callTool("echo");
+	assert.equal(mcpContentToText(result), "reconnected");
+	assert.equal(helpers.length, 2);
+	assert.equal(client.state, "ready");
+	client.stop();
+});
+
+test("serial calls preserve queue order and idle close waits for active and queued work", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	let helper!: FakeSoloHelper;
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 25,
+		requestTimeoutMs: 1_000,
+		spawn: () => {
+			helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "echo" }] }),
+				"tools/call": () => NO_RESPONSE,
+			});
+			return helper as any;
+		},
+	});
+	await client.start();
+
+	const first = client.callTool("echo", { order: 1 });
+	const second = client.callTool("echo", { order: 2 });
+	await new Promise((resolve) => setImmediate(resolve));
+	let calls = helper.requests.filter((request) => request.method === "tools/call");
+	assert.deepEqual(calls.map((request) => (request.params as any).arguments.order), [1]);
+
+	t.mock.timers.tick(25);
+	assert.equal(helper.killed, false, "active request must prevent idle close");
+	const firstRequest = calls[0]!;
+	helper.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: firstRequest.id, result: { content: [{ type: "text", text: "first" }] } })}\n`);
+	assert.equal(mcpContentToText(await first), "first");
+	await new Promise((resolve) => setImmediate(resolve));
+	calls = helper.requests.filter((request) => request.method === "tools/call");
+	assert.deepEqual(calls.map((request) => (request.params as any).arguments.order), [1, 2]);
+
+	t.mock.timers.tick(25);
+	assert.equal(helper.killed, false, "queued request must be active before idle close");
+	const secondRequest = calls[1]!;
+	helper.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: secondRequest.id, result: { content: [{ type: "text", text: "second" }] } })}\n`);
+	assert.equal(mcpContentToText(await second), "second");
+	t.mock.timers.tick(25);
+	assert.equal(helper.killed, true, "transport closes only after the queue drains");
 	client.stop();
 });
 
