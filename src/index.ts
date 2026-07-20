@@ -22,7 +22,7 @@ interface RuntimeState {
 	ctx?: ExtensionContext;
 }
 
-export default function solotermExtension(pi: ExtensionAPI): void {
+export default function solotermExtension(pi: ExtensionAPI, injectedClient?: SoloMcpClient): void {
 	const runtime: RuntimeState = { active: true, source: "restore" };
 
 	pi.registerFlag("soloterm", {
@@ -31,7 +31,7 @@ export default function solotermExtension(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-	const client = new SoloMcpClient({
+	const client = injectedClient ?? new SoloMcpClient({
 		onStateChange: () => updateStatus(runtime.ctx),
 	});
 
@@ -104,7 +104,13 @@ export default function solotermExtension(pi: ExtensionAPI): void {
 		runtime.source = restored.source;
 		applyTools();
 		updateStatus(ctx);
-		if (runtime.active) await client.start();
+		if (runtime.active) {
+			// Session startup must not wait for the MCP handshake. callTool's lazy
+			// ensureChild path remains authoritative if this warm-up fails.
+			void client.start().catch(() => {
+				// Client state already retains the diagnostic for status reporting.
+			});
+		}
 	});
 
 	pi.on("session_shutdown", () => {

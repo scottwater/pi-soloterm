@@ -113,8 +113,10 @@ export interface SoloMcpClientOptions {
 }
 
 export interface SoloCallToolLike {
-	callTool(name: string, args?: unknown): Promise<McpToolCallResult>;
+	callTool(name: string, args?: unknown, signal?: AbortSignal): Promise<McpToolCallResult>;
 	hasTool(name: string): boolean;
+	/** True when a missing catalog can be reloaded by the next authoritative call. */
+	canAttemptTool?(name: string): boolean;
 	tools: McpToolDef[];
 	identity?: SoloIdentity;
 	identityError?: string;
@@ -277,9 +279,9 @@ export class SoloMcpClient implements SoloCallToolLike {
 	}
 
 	async restart(): Promise<void> {
-		this.killChild();
-		this.stopped = false;
-		this.state = "stopped";
+		// Treat restart as a full generation boundary so queued calls from the old
+		// transport cannot execute after the replacement is ready.
+		this.stop();
 		await this.start();
 	}
 
@@ -300,6 +302,10 @@ export class SoloMcpClient implements SoloCallToolLike {
 		return this.tools.some((tool) => tool.name === name);
 	}
 
+	canAttemptTool(name: string): boolean {
+		return this.hasTool(name) || (!this.stopped && !this.child);
+	}
+
 	getTool(name: string): McpToolDef | undefined {
 		return this.tools.find((tool) => tool.name === name);
 	}
@@ -316,12 +322,37 @@ export class SoloMcpClient implements SoloCallToolLike {
 		return this.tools.length === 0 && this.serverInfo?.instructions?.toLowerCase().includes("disabled") === true;
 	}
 
-	async callTool(name: string, args: unknown = {}): Promise<McpToolCallResult> {
+	async callTool(name: string, args: unknown = {}, signal?: AbortSignal): Promise<McpToolCallResult> {
+		if (signal?.aborted) throw this.abortError(signal);
+		if (this.stopped) throw new Error("Solo MCP client stopped");
+		const enqueuedGeneration = this.generation;
 		return this.enqueueCall(async () => {
-			await this.ensureChild();
+			if (enqueuedGeneration !== this.generation) {
+				throw new Error(`Solo MCP queued call '${name}' rejected because the client generation changed`);
+			}
+			if (signal?.aborted) throw this.abortError(signal);
+			let active = true;
+			let operationChild: SoloMcpTransport | undefined;
+			const abort = () => {
+				if (!active || !operationChild) return;
+				this.invalidateTransport("Solo MCP request cancelled", true, operationChild);
+			};
+			signal?.addEventListener("abort", abort, { once: true });
 			try {
+				const ensuring = this.ensureChild();
+				// ensureChild spawns synchronously before its first await. Retain that
+				// exact transport so a late abort can never invalidate a newer one.
+				operationChild = this.child;
+				await ensuring;
+				if (signal?.aborted) throw this.abortError(signal);
+				operationChild = this.child;
 				return await this.request<McpToolCallResult>("tools/call", { name, arguments: args });
+			} catch (error) {
+				if (signal?.aborted) throw this.abortError(signal);
+				throw error;
 			} finally {
+				active = false;
+				signal?.removeEventListener("abort", abort);
 				this.touchIdle();
 			}
 		});
@@ -329,8 +360,10 @@ export class SoloMcpClient implements SoloCallToolLike {
 
 	private async ensureChild(): Promise<void> {
 		if (this.stopped) throw new Error("Solo MCP client stopped");
-		if (this.child) return;
+		// A child exists before handshake/catalog loading completes. Authoritative
+		// calls during warm-up must join startup rather than use the half-ready transport.
 		if (this.ensurePromise) return this.ensurePromise;
+		if (this.child) return;
 		if (!this.exists(this.helperPath)) throw new Error(`Solo MCP helper not found at ${this.helperPath}`);
 
 		this.state = "warming";
@@ -469,7 +502,7 @@ export class SoloMcpClient implements SoloCallToolLike {
 				this.pending.delete(id);
 				const message = `Solo MCP request '${method}' timed out after ${timeoutMs}ms`;
 				reject(new Error(this.withDiagnostics(message)));
-				this.invalidateTransport(message);
+				this.invalidateTransport(message, true, child);
 			}, timeoutMs);
 
 			this.pending.set(id, {
@@ -484,14 +517,14 @@ export class SoloMcpClient implements SoloCallToolLike {
 					clearTimeout(timer);
 					this.pending.delete(id);
 					reject(error);
-					this.invalidateTransport(`Solo MCP transport write failed: ${error.message}`);
+					this.invalidateTransport(`Solo MCP transport write failed: ${error.message}`, true, child);
 				});
 			} catch (error) {
 				clearTimeout(timer);
 				this.pending.delete(id);
 				const failure = error instanceof Error ? error : new Error(String(error));
 				reject(failure);
-				this.invalidateTransport(`Solo MCP transport write failed: ${failure.message}`);
+				this.invalidateTransport(`Solo MCP transport write failed: ${failure.message}`, true, child);
 			}
 		});
 	}
@@ -557,7 +590,16 @@ export class SoloMcpClient implements SoloCallToolLike {
 		return this.withDiagnostics(error instanceof Error ? error.message : String(error));
 	}
 
-	private invalidateTransport(message: string, kill = true): void {
+	private abortError(signal: AbortSignal): Error {
+		const reason = signal.reason instanceof Error ? signal.reason.message : signal.reason == null ? "operation aborted" : String(signal.reason);
+		const error = new Error(`Solo MCP request cancelled: ${reason}`);
+		error.name = "AbortError";
+		return error;
+	}
+
+	private invalidateTransport(message: string, kill = true, expectedChild?: SoloMcpTransport): void {
+		if (expectedChild && this.child !== expectedChild) return;
+		this.generation++;
 		const error = new Error(this.withDiagnostics(message));
 		this.failPending(error);
 		if (kill) this.killChild();

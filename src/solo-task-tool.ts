@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { defaultTaskName, runSoloTask, summarizeSoloTask, type SoloTaskSpec, type SpawnedSoloTask } from "./solo-subagents.ts";
+import { cleanupSoloProcess, defaultTaskName, runSoloTask, summarizeSoloTask, type SoloTaskSpec, type SpawnedSoloTask } from "./solo-subagents.ts";
 import type { SoloCallToolLike } from "./solo-mcp-client.ts";
 
 const SingleTaskParams = Type.Object({
@@ -75,19 +75,58 @@ function normalizeSingleTask(params: SingleTaskArgs, piFlags: string[] = ["--sol
 	};
 }
 
-async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+function cancellationError(signal: AbortSignal): Error {
+	const reason = signal.reason instanceof Error ? signal.reason.message : signal.reason == null ? "operation aborted" : String(signal.reason);
+	const error = new Error(`solo_task cancelled: ${reason}`);
+	error.name = "AbortError";
+	return error;
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+	if (signal?.aborted) throw cancellationError(signal);
+}
+
+async function mapWithConcurrency<T, R>(
+	items: readonly T[],
+	concurrency: number,
+	fn: (item: T, index: number) => Promise<R>,
+	signal?: AbortSignal,
+	onCancelledResult?: (result: R, index: number) => Promise<string>,
+): Promise<R[]> {
 	const limit = Math.max(1, Math.min(concurrency, items.length));
 	const results = new Array<R>(items.length);
+	const completedIndexes: number[] = [];
+	const failures: unknown[] = [];
 	let next = 0;
 	await Promise.all(
 		new Array(limit).fill(null).map(async () => {
 			while (true) {
+				if (signal?.aborted) return;
 				const index = next++;
 				if (index >= items.length) return;
-				results[index] = await fn(items[index]!, index);
+				try {
+					results[index] = await fn(items[index]!, index);
+					completedIndexes.push(index);
+				} catch (error) {
+					failures.push(error);
+				}
+				if (signal?.aborted) return;
 			}
 		}),
 	);
+	if (signal?.aborted) {
+		const cancelled = cancellationError(signal);
+		const returnedDiagnostics = onCancelledResult
+			? await Promise.all(completedIndexes.map((index) => onCancelledResult(results[index]!, index)))
+			: [];
+		const diagnostics = [
+			...returnedDiagnostics,
+			...failures.map((error) => error instanceof Error ? error.message : String(error)),
+		].filter(Boolean);
+		if (diagnostics.length > 0) cancelled.message += `; started worker cleanup: ${diagnostics.join(" | ")}`;
+		throw cancelled;
+	}
+	if (failures.length > 0) throw failures[0];
 	return results;
 }
 
@@ -99,10 +138,27 @@ async function runTaskSafely(
 	runner: typeof runSoloTask,
 	client: SoloCallToolLike,
 	spec: SoloTaskSpec,
+	signal?: AbortSignal,
+	cleanupReturned: (result: SpawnedSoloTask) => Promise<string> = async (result) => {
+		const cleanup = await cleanupSoloProcess(client, result.processId);
+		return cleanup.diagnostic;
+	},
 ): Promise<SpawnedSoloTask> {
 	try {
-		return await runner(client, spec);
+		const result = await runner(client, spec, signal);
+		if (signal?.aborted) {
+			const cancelled = cancellationError(signal);
+			if (result.processId > 0 && spec.closeOnComplete !== true) {
+				cancelled.message += `; ${await cleanupReturned(result)}`;
+			} else if (result.processId > 0) {
+				cancelled.message += `; Solo process #${result.processId} was returned after closeOnComplete cancellation; original cleanup outcome is unavailable`;
+			}
+			throw cancelled;
+		}
+		return result;
 	} catch (error) {
+		if (error instanceof Error && error.name === "AbortError") throw error;
+		throwIfCancelled(signal);
 		return {
 			id: randomUUID(),
 			name: spec.name,
@@ -130,7 +186,8 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 			"Use solo_task with tasks[] for independent parallel investigations requested by skills.",
 		],
 		parameters: SoloTermTaskParams,
-		async execute(_toolCallId, params: SoloTermTaskArgs, _signal: AbortSignal | undefined) {
+		async execute(_toolCallId, params: SoloTermTaskArgs, signal: AbortSignal | undefined) {
+			throwIfCancelled(signal);
 			if (!deps.isActive()) return unavailable("SoloTerm mode is not active. Run /soloterm on or start Pi with --soloterm.");
 			if (!deps.isClientReady()) {
 				return unavailable("Solo MCP is not ready. Make sure Solo is running, MCP is enabled in Solo Settings → MCP, and a Pi agent tool is configured in Solo Settings → Agents.");
@@ -141,7 +198,26 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 			const runner = deps.runTask ?? runSoloTask;
 			try {
 				if (tasks) {
-					const results = await mapWithConcurrency(tasks, params.concurrency ?? 4, async (task) => runTaskSafely(runner, deps.client, normalizeSingleTask(task, piFlags)));
+					const specs = tasks.map((task) => normalizeSingleTask(task, piFlags));
+					const cleanupAttempts = new Map<number, Promise<string>>();
+					const cleanupOnce = (result: SpawnedSoloTask, index: number): Promise<string> => {
+						if (result.processId <= 0) return Promise.resolve(`worker ${index + 1} returned no Solo process ID`);
+						if (specs[index]?.closeOnComplete === true) {
+							return Promise.resolve(`Solo process #${result.processId} was already returned after closeOnComplete`);
+						}
+						const existing = cleanupAttempts.get(result.processId);
+						if (existing) return existing;
+						const attempt = cleanupSoloProcess(deps.client, result.processId).then((outcome) => outcome.diagnostic);
+						cleanupAttempts.set(result.processId, attempt);
+						return attempt;
+					};
+					const results = await mapWithConcurrency(
+						specs,
+						params.concurrency ?? 4,
+						async (spec, index) => runTaskSafely(runner, deps.client, spec, signal, (result) => cleanupOnce(result, index)),
+						signal,
+						cleanupOnce,
+					);
 					const succeeded = results.filter(taskSucceeded).length;
 					const summary = `Parallel SoloTerm tasks: ${succeeded}/${results.length} completed\n\n${results.map(summarizeSoloTask).join("\n\n---\n\n")}`;
 					if (succeeded !== results.length) throw new Error(summary);
@@ -155,7 +231,7 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 					return unavailable("solo_task requires either a single task string or a non-empty tasks array.");
 				}
 
-				const result = await runTaskSafely(runner, deps.client, normalizeSingleTask(params as SingleTaskArgs, piFlags));
+				const result = await runTaskSafely(runner, deps.client, normalizeSingleTask(params as SingleTaskArgs, piFlags), signal);
 				const summary = summarizeSoloTask(result);
 				if (!taskSucceeded(result)) throw new Error(summary);
 				return {
@@ -163,6 +239,7 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 					details: { mode: "single", result },
 				};
 			} catch (error) {
+				if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
 				const message = error instanceof Error ? error.message : String(error);
 				throw new Error(`solo_task failed: ${message}`);
 			}

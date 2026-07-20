@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
+import { cleanupSoloProcess } from "../src/solo-subagents.ts";
 import {
 	parseJsonRpcLine,
 	SoloMcpClient,
@@ -101,6 +102,47 @@ test("SoloMcpClient handshakes, lists catalog, and calls tools with fake helper"
 	assert.equal(helper.killed, true);
 });
 
+test("an authoritative call during warm-up waits for handshake and catalog loading", async () => {
+	let helper!: FakeSoloHelper;
+	let initialized = false;
+	let catalogLoaded = false;
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		requestTimeoutMs: 1_000,
+		spawn: () => {
+			helper = new FakeSoloHelper({
+				initialize: () => NO_RESPONSE,
+				"tools/list": () => {
+					assert.equal(initialized, true);
+					catalogLoaded = true;
+					return { tools: [{ name: "echo" }] };
+				},
+				"tools/call": () => {
+					assert.equal(catalogLoaded, true);
+					return { content: [{ type: "text", text: "ready" }] };
+				},
+			});
+			return helper as any;
+		},
+	});
+
+	const warming = client.start();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(client.state, "warming");
+	const operation = client.callTool("echo");
+	const initialize = helper.requests.find((request) => request.method === "initialize");
+	assert.ok(initialize);
+	initialized = true;
+	helper.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: initialize.id, result: { protocolVersion: "2024-11-05" } })}\n`);
+
+	assert.equal(mcpContentToText(await operation), "ready");
+	await warming;
+	assert.equal(client.hasTool("echo"), true);
+	client.stop();
+});
+
 test("SoloMcpClient reconnects after stop and does not retain stale metadata", async () => {
 	let spawnCount = 0;
 	let catalog = [{ name: "old_tool" }];
@@ -158,6 +200,157 @@ test("stop aborts an in-flight startup and a later start uses a fresh transport"
 	assert.equal(spawnCount, 2);
 	assert.equal(client.state, "ready");
 	assert.equal(client.hasTool("fresh_tool"), true);
+	client.stop();
+});
+
+test("queued tool calls cannot cross a stop and start generation", async () => {
+	const helpers: FakeSoloHelper[] = [];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp", exists: () => true, idleCloseMs: 0, requestTimeoutMs: 5_000,
+		spawn: () => {
+			const sequence = helpers.length;
+			const helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "hang" }, { name: "spawn_agent" }] }),
+				"tools/call": (params: any) => sequence === 0 && params.name === "hang" ? NO_RESPONSE : {},
+			});
+			helpers.push(helper);
+			return helper as any;
+		},
+	});
+	await client.start();
+
+	const hanging = client.callTool("hang");
+	const staleSpawn = client.callTool("spawn_agent", { name: "stale" });
+	await new Promise((resolve) => setImmediate(resolve));
+	client.stop();
+	const starting = client.start();
+	await assert.rejects(hanging, /client stopped/);
+	await assert.rejects(staleSpawn, /generation changed/);
+	await starting;
+	assert.equal(helpers.length, 2);
+	assert.equal(helpers[1]!.requests.some((request) => request.method === "tools/call" && (request.params as any)?.name === "spawn_agent"), false);
+	client.stop();
+});
+
+test("tool calls submitted while stopped cannot execute after restart", async () => {
+	const helpers: FakeSoloHelper[] = [];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp", exists: () => true, idleCloseMs: 0,
+		spawn: () => {
+			const helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "spawn_agent" }] }),
+				"tools/call": () => ({}),
+			});
+			helpers.push(helper);
+			return helper as any;
+		},
+	});
+	client.stop();
+
+	const blocked = client.callTool("spawn_agent", { name: "stale" });
+	await client.start();
+	await assert.rejects(blocked, /client stopped/);
+	assert.equal(helpers.length, 1);
+	assert.equal(helpers[0]!.requests.some((request) => request.method === "tools/call"), false);
+	client.stop();
+});
+
+test("queued tool calls cannot cross restart generation", async () => {
+	const helpers: FakeSoloHelper[] = [];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp", exists: () => true, idleCloseMs: 0, requestTimeoutMs: 5_000,
+		spawn: () => {
+			const sequence = helpers.length;
+			const helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "hang" }, { name: "send_input" }] }),
+				"tools/call": (params: any) => sequence === 0 && params.name === "hang" ? NO_RESPONSE : {},
+			});
+			helpers.push(helper);
+			return helper as any;
+		},
+	});
+	await client.start();
+
+	const hanging = client.callTool("hang");
+	const staleSend = client.callTool("send_input", { process_id: 9, input: "stale" });
+	await new Promise((resolve) => setImmediate(resolve));
+	const restarting = client.restart();
+	await assert.rejects(hanging, /client stopped/);
+	await assert.rejects(staleSend, /generation changed/);
+	await restarting;
+	assert.equal(helpers.length, 2);
+	assert.equal(helpers[1]!.requests.some((request) => request.method === "tools/call" && (request.params as any)?.name === "send_input"), false);
+	client.stop();
+});
+
+test("cancelling a real serialized request invalidates its transport and sends queued cleanup after reconnect", async () => {
+	const helpers: FakeSoloHelper[] = [];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp",
+		exists: () => true,
+		idleCloseMs: 0,
+		requestTimeoutMs: 5_000,
+		spawn: () => {
+			const sequence = helpers.length;
+			const helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "hang" }, { name: "close_process" }] }),
+				"tools/call": (params: any) => sequence === 0 && params.name === "hang"
+					? NO_RESPONSE
+					: { structuredContent: { closed: params.arguments?.process_id } },
+			});
+			helpers.push(helper);
+			return helper as any;
+		},
+	});
+	await client.start();
+
+	const controller = new AbortController();
+	const hanging = client.callTool("hang", {}, controller.signal);
+	await new Promise((resolve) => setImmediate(resolve));
+	controller.abort(new Error("operator cancelled"));
+	await assert.rejects(hanging, /request cancelled: operator cancelled/);
+	assert.equal(helpers[0]?.killed, true);
+
+	const cleanupOutcome = await cleanupSoloProcess(client, 73, 100);
+	assert.deepEqual(cleanupOutcome, { cleaned: true, diagnostic: "cleaned up Solo process #73" });
+	assert.equal(helpers.length, 2);
+	const cleanup = helpers[1]?.requests.find((request) => request.method === "tools/call" && (request.params as any)?.name === "close_process");
+	assert.equal((cleanup?.params as any)?.arguments?.process_id, 73);
+	client.stop();
+});
+
+test("concurrent cleanup attempts each receive a timeout after acquiring execution", async () => {
+	const helpers: FakeSoloHelper[] = [];
+	const client = new SoloMcpClient({
+		helperPath: "/fake/mcp", exists: () => true, idleCloseMs: 0, requestTimeoutMs: 5_000,
+		spawn: () => {
+			const sequence = helpers.length;
+			const helper = new FakeSoloHelper({
+				initialize: () => ({ protocolVersion: "2024-11-05" }),
+				"tools/list": () => ({ tools: [{ name: "close_process" }] }),
+				"tools/call": (params: any) => sequence === 0 && params.arguments?.process_id === 81
+					? NO_RESPONSE
+					: { structuredContent: { closed: params.arguments?.process_id } },
+			});
+			helpers.push(helper);
+			return helper as any;
+		},
+	});
+	await client.start();
+
+	const [first, second] = await Promise.all([
+		cleanupSoloProcess(client, 81, 20),
+		cleanupSoloProcess(client, 82, 100),
+	]);
+	assert.equal(first.cleaned, false);
+	assert.match(first.diagnostic, /Solo process #81.*timed out/);
+	assert.deepEqual(second, { cleaned: true, diagnostic: "cleaned up Solo process #82" });
+	assert.equal(helpers.length, 2);
+	assert.equal(helpers[1]!.requests.some((request) => request.method === "tools/call" && (request.params as any)?.arguments?.process_id === 82), true);
 	client.stop();
 });
 

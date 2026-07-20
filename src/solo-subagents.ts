@@ -124,8 +124,9 @@ function extractAgentTools(result: McpToolCallResult): AgentToolRecord[] {
 export async function resolveSoloAgentTool(
 	client: SoloCallToolLike,
 	requested?: string | number,
+	signal?: AbortSignal,
 ): Promise<ResolvedSoloAgentTool> {
-	const result = await client.callTool("list_agent_tools", {});
+	const result = await callToolAbortable(client, "list_agent_tools", {}, signal);
 	if (soloToolResultIsError(result)) throw new Error(`list_agent_tools failed: ${errorText(result)}`);
 
 	const enabled = extractAgentTools(result).filter((tool) => tool.enabled !== false);
@@ -169,16 +170,17 @@ export function buildPiExtraArgs(spec: SoloTaskSpec, isPiAgent: boolean): string
 async function precreateScratchpad(
 	client: SoloCallToolLike,
 	spec: SoloTaskSpec,
+	signal: AbortSignal | undefined,
 ): Promise<{ name: string; id?: number } | undefined> {
 	if (spec.useScratchpad !== true || !client.hasTool("scratchpad_write")) return undefined;
 	const name = buildArtifactScratchpadName(spec.role, spec.name);
 	const content = `# ${name}\n\nReserved for SoloTerm task artifact.\n\nTask: ${spec.name}\n`;
 	try {
-		const result = await client.callTool("scratchpad_write", {
+		const result = await callToolAbortable(client, "scratchpad_write", {
 			name,
 			content,
 			tags: ["solo", "subagent", ...(spec.role ? [safeSlug(spec.role)] : [])],
-		});
+		}, signal);
 		if (soloToolResultIsError(result)) return { name };
 		return { name, id: extractScratchpadId(result) };
 	} catch {
@@ -186,27 +188,139 @@ async function precreateScratchpad(
 	}
 }
 
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+export interface SoloTaskRuntime {
+	now: () => number;
+	delay: (ms: number, signal?: AbortSignal) => Promise<void>;
+	readyPollMs: number;
+	idlePollMs: number;
+	idleGraceMs: number;
+	idleConsecutive: number;
+	readyTransientErrorLimit: number;
+	cleanupTimeoutMs: number;
 }
 
-async function waitForReady(client: SoloCallToolLike, processId: number, timeoutMs = 20_000): Promise<void> {
-	const started = Date.now();
-	while (Date.now() - started < timeoutMs) {
+function cancellationError(signal: AbortSignal): Error {
+	const reason = signal.reason instanceof Error ? signal.reason.message : signal.reason == null ? "operation aborted" : String(signal.reason);
+	const error = new Error(`solo_task cancelled: ${reason}`);
+	error.name = "AbortError";
+	return error;
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+	if (signal?.aborted) throw cancellationError(signal);
+}
+
+function awaitRequestCancellation(
+	request: Promise<McpToolCallResult>,
+	signal?: AbortSignal,
+): Promise<McpToolCallResult> {
+	throwIfCancelled(signal);
+	if (!signal) return request;
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		const abort = () => {
+			if (finished) return;
+			finished = true;
+			reject(cancellationError(signal));
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		request.then(
+			(result) => {
+				if (finished) return;
+				finished = true;
+				signal.removeEventListener("abort", abort);
+				resolve(result);
+			},
+			(error) => {
+				if (finished) return;
+				finished = true;
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+	});
+}
+
+function callToolAbortable(
+	client: SoloCallToolLike,
+	name: string,
+	args: unknown,
+	signal?: AbortSignal,
+): Promise<McpToolCallResult> {
+	throwIfCancelled(signal);
+	return awaitRequestCancellation(Promise.resolve().then(() => client.callTool(name, args, signal)), signal);
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+	throwIfCancelled(signal);
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(finish, ms);
+		function finish(): void {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		}
+		function abort(): void {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(cancellationError(signal!));
+		}
+		signal?.addEventListener("abort", abort, { once: true });
+	});
+}
+
+const DEFAULT_TASK_RUNTIME: SoloTaskRuntime = {
+	now: Date.now,
+	delay: abortableDelay,
+	readyPollMs: 300,
+	idlePollMs: 250,
+	idleGraceMs: 1_500,
+	idleConsecutive: 2,
+	readyTransientErrorLimit: 3,
+	cleanupTimeoutMs: 500,
+};
+
+function isClearlyTransientReadinessError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /temporar|timeout|timed out|connection|transport|not ready|starting|busy|pty|input\/output/i.test(message);
+}
+
+async function waitForReady(
+	client: SoloCallToolLike,
+	processId: number,
+	signal: AbortSignal | undefined,
+	runtime: SoloTaskRuntime,
+	timeoutMs = 20_000,
+): Promise<void> {
+	const started = runtime.now();
+	let transientErrors = 0;
+	while (runtime.now() - started < timeoutMs) {
+		throwIfCancelled(signal);
 		try {
-			const result = await client.callTool("get_process_status", { process_id: processId });
+			const result = await callToolAbortable(client, "get_process_status", { process_id: processId }, signal);
+			throwIfCancelled(signal);
+			if (soloToolResultIsError(result)) {
+				const message = `get_process_status failed: ${errorText(result)}`;
+				if (!isClearlyTransientReadinessError(message) || ++transientErrors > runtime.readyTransientErrorLimit) {
+					throw new Error(message);
+				}
+				await runtime.delay(runtime.readyPollMs, signal);
+				continue;
+			}
 			const data = extractStructuredOrTextJson<any>(result);
 			if (data?.agent_state?.idle === true) return;
 			if (data?.status === "running") {
 				// A process can report running before its PTY is ready to receive input.
-				await delay(500);
+				await runtime.delay(runtime.readyPollMs, signal);
 				return;
 			}
-		} catch {
-			// Keep waiting for a freshly spawned process.
+			transientErrors = 0;
+		} catch (error) {
+			throwIfCancelled(signal);
+			if (!isClearlyTransientReadinessError(error) || ++transientErrors > runtime.readyTransientErrorLimit) throw error;
 		}
-		await delay(300);
+		await runtime.delay(runtime.readyPollMs, signal);
 	}
+	throw new Error(`Solo process #${processId} was not ready after ${timeoutMs}ms.`);
 }
 
 interface ProcessCompletion {
@@ -247,22 +361,38 @@ async function waitForIdle(
 	client: SoloCallToolLike,
 	processId: number,
 	maxWaitMs: number,
+	signal: AbortSignal | undefined,
+	runtime: SoloTaskRuntime,
 ): Promise<ProcessCompletion> {
-	const started = Date.now();
+	const started = runtime.now();
 	let sawBusy = false;
-	while (Date.now() - started < maxWaitMs) {
-		try {
-			const result = await client.callTool("get_process_status", { process_id: processId });
-			const data = extractStructuredOrTextJson<any>(result);
-			const state = data?.agent_state;
-			if (state?.thinking || state?.planning || state?.idle === false) sawBusy = true;
-			const completion = classifyTerminalProcessStatus(data?.status);
-			if (completion) return completion;
-			if (state?.idle === true && sawBusy) return { status: "completed" };
-		} catch {
-			// Status failures may be transient while Solo starts the agent.
+	let idleSince: number | undefined;
+	let consecutiveIdle = 0;
+	while (runtime.now() - started < maxWaitMs) {
+		throwIfCancelled(signal);
+		const result = await callToolAbortable(client, "get_process_status", { process_id: processId }, signal);
+		throwIfCancelled(signal);
+		if (soloToolResultIsError(result)) throw new Error(`get_process_status failed: ${errorText(result)}`);
+		const data = extractStructuredOrTextJson<any>(result);
+		const state = data?.agent_state;
+		if (state?.thinking || state?.planning || state?.idle === false) {
+			sawBusy = true;
+			idleSince = undefined;
+			consecutiveIdle = 0;
 		}
-		await delay(1_000);
+		const completion = classifyTerminalProcessStatus(data?.status);
+		if (completion) return completion;
+		if (state?.idle === true) {
+			idleSince ??= runtime.now();
+			consecutiveIdle += 1;
+			const stableWithoutBusy = runtime.now() - idleSince >= runtime.idleGraceMs
+				&& consecutiveIdle >= runtime.idleConsecutive;
+			if (sawBusy || stableWithoutBusy) return { status: "completed" };
+		} else if (!sawBusy) {
+			idleSince = undefined;
+			consecutiveIdle = 0;
+		}
+		await runtime.delay(runtime.idlePollMs, signal);
 	}
 	return { status: "timeout" };
 }
@@ -273,13 +403,14 @@ function normalizeCapturedOutput(value: string | undefined): string | undefined 
 	return value;
 }
 
-async function readProcessOutput(client: SoloCallToolLike, processId: number): Promise<string | undefined> {
+async function readProcessOutput(client: SoloCallToolLike, processId: number, signal?: AbortSignal): Promise<string | undefined> {
 	if (!client.hasTool("get_process_output")) return undefined;
 	try {
-		const result = await client.callTool("get_process_output", { process_id: processId, lines: 200 });
+		const result = await callToolAbortable(client, "get_process_output", { process_id: processId, lines: 200 }, signal);
 		if (soloToolResultIsError(result)) return undefined;
 		return normalizeCapturedOutput(mcpContentToText(result) || JSON.stringify(extractStructuredOrTextJson(result) ?? "", null, 2));
 	} catch {
+		throwIfCancelled(signal);
 		return undefined;
 	}
 }
@@ -287,44 +418,98 @@ async function readProcessOutput(client: SoloCallToolLike, processId: number): P
 async function readScratchpadArtifact(
 	client: SoloCallToolLike,
 	artifact: { id?: number; name: string } | undefined,
+	signal?: AbortSignal,
 ): Promise<string | undefined> {
 	if (!artifact || !client.hasTool("scratchpad_read")) return undefined;
 	try {
 		let id = artifact.id;
 		if (id == null && client.hasTool("scratchpad_list")) {
-			const listResult = await client.callTool("scratchpad_list", {});
+			const listResult = await callToolAbortable(client, "scratchpad_list", {}, signal);
 			const listData = extractStructuredOrTextJson<any>(listResult);
 			const scratchpads = Array.isArray(listData?.scratchpads) ? listData.scratchpads : Array.isArray(listData) ? listData : [];
 			id = scratchpads.find((scratchpad: any) => scratchpad?.name === artifact.name)?.id;
 		}
 		if (typeof id !== "number") return undefined;
-		const result = await client.callTool("scratchpad_read", { scratchpad_id: id, mode: "full" });
+		const result = await callToolAbortable(client, "scratchpad_read", { scratchpad_id: id, mode: "full" }, signal);
 		if (soloToolResultIsError(result)) return undefined;
 		const data = extractStructuredOrTextJson<any>(result);
 		return data?.scratchpad?.content ?? data?.content ?? mcpContentToText(result);
 	} catch {
+		throwIfCancelled(signal);
 		return undefined;
 	}
 }
 
-async function closeProcess(client: SoloCallToolLike, processId: number): Promise<void> {
-	if (!client.hasTool("close_process")) return;
-	try {
-		await client.callTool("close_process", { process_id: processId });
-	} catch {
-		// Best effort cleanup.
-	}
+export interface CleanupOutcome {
+	cleaned: boolean;
+	diagnostic: string;
 }
 
-async function sendInputWithRetry(client: SoloCallToolLike, processId: number, prompt: string): Promise<void> {
+const cleanupQueues = new WeakMap<SoloCallToolLike, Promise<void>>();
+
+function enqueueCleanup<T>(client: SoloCallToolLike, operation: () => Promise<T>): Promise<T> {
+	const previous = cleanupQueues.get(client) ?? Promise.resolve();
+	const current = previous.catch(() => {}).then(operation);
+	cleanupQueues.set(client, current.then(() => {}, () => {}));
+	return current;
+}
+
+export async function cleanupSoloProcess(
+	client: SoloCallToolLike,
+	processId: number,
+	timeoutMs = DEFAULT_TASK_RUNTIME.cleanupTimeoutMs,
+): Promise<CleanupOutcome> {
+	if (!client.hasTool("close_process") && client.canAttemptTool?.("close_process") !== true) {
+		return { cleaned: false, diagnostic: `cleanup unavailable; Solo process #${processId} remains open (orphan risk)` };
+	}
+	return enqueueCleanup(client, async () => {
+		// Start this timeout only after this cleanup owns the per-client execution
+		// slot. Time spent behind an earlier cleanup does not consume its window.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const controller = new AbortController();
+		try {
+			const request = Promise.resolve().then(() => client.callTool("close_process", { process_id: processId }, controller.signal));
+			const timeout = new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => {
+					controller.abort(new Error(`cleanup timed out after ${timeoutMs}ms`));
+					reject(new Error(`cleanup timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+			});
+			const result = await Promise.race([request, timeout]);
+			if (soloToolResultIsError(result)) {
+				return { cleaned: false, diagnostic: `cleanup failed for Solo process #${processId}: ${errorText(result)} (orphan risk)` };
+			}
+			return { cleaned: true, diagnostic: `cleaned up Solo process #${processId}` };
+		} catch (error) {
+			return {
+				cleaned: false,
+				diagnostic: `cleanup failed for Solo process #${processId}: ${error instanceof Error ? error.message : String(error)} (orphan risk)`,
+			};
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	});
+}
+
+async function sendInputWithRetry(
+	client: SoloCallToolLike,
+	processId: number,
+	prompt: string,
+	signal: AbortSignal | undefined,
+	runtime: SoloTaskRuntime,
+): Promise<void> {
 	let lastError = "unknown send_input error";
 	for (let attempt = 0; attempt < 4; attempt++) {
-		if (attempt > 0) await delay(750 * attempt);
+		throwIfCancelled(signal);
+		if (attempt > 0) await runtime.delay(750 * attempt, signal);
+		throwIfCancelled(signal);
 		try {
-			const result = await client.callTool("send_input", { process_id: processId, input: prompt, submit: true });
+			const result = await callToolAbortable(client, "send_input", { process_id: processId, input: prompt, submit: true }, signal);
+			throwIfCancelled(signal);
 			if (!soloToolResultIsError(result)) return;
 			lastError = errorText(result);
 		} catch (error) {
+			throwIfCancelled(signal);
 			lastError = error instanceof Error ? error.message : String(error);
 		}
 		if (!/pty|input\/output|not ready|busy|starting/i.test(lastError)) break;
@@ -332,7 +517,16 @@ async function sendInputWithRetry(client: SoloCallToolLike, processId: number, p
 	throw new Error(`send_input failed: ${lastError}`);
 }
 
-export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec): Promise<SpawnedSoloTask> {
+export async function runSoloTask(
+	client: SoloCallToolLike,
+	spec: SoloTaskSpec,
+	signal?: AbortSignal,
+	runtime: SoloTaskRuntime = DEFAULT_TASK_RUNTIME,
+): Promise<SpawnedSoloTask> {
+	throwIfCancelled(signal);
+	// This authoritative call lazily finishes startup/catalog loading before
+	// hasTool checks, including when session warm-up is still in progress.
+	const agentTool = await resolveSoloAgentTool(client, spec.agentTool, signal);
 	for (const required of ["list_agent_tools", "send_input", "get_process_status"]) {
 		if (!client.hasTool(required)) throw new Error(`Solo MCP tool '${required}' is required for solo_task.`);
 	}
@@ -340,43 +534,99 @@ export async function runSoloTask(client: SoloCallToolLike, spec: SoloTaskSpec):
 		throw new Error("Solo MCP tool 'spawn_agent' is required. Update Solo and enable MCP + Agents integration.");
 	}
 
-	const artifact = await precreateScratchpad(client, spec);
-	const agentTool = await resolveSoloAgentTool(client, spec.agentTool);
-	const spawnResult = await client.callTool("spawn_agent", {
+	const artifact = await precreateScratchpad(client, spec, signal);
+	throwIfCancelled(signal);
+	const spawnArgs = {
 		agent_tool_id: agentTool.id,
 		name: spec.name.slice(0, 48) || "SoloTerm task",
 		include_agent_instructions: true,
 		extra_args: buildPiExtraArgs(spec, agentTool.isPi),
-	});
+	};
+	const spawnRequest = Promise.resolve().then(() => client.callTool("spawn_agent", spawnArgs, signal));
+	let spawnResult: McpToolCallResult;
+	try {
+		spawnResult = await awaitRequestCancellation(spawnRequest, signal);
+	} catch (error) {
+		if (!signal?.aborted) throw error;
+		// callToolAbortable owns a separate request only for legacy/fake clients, so
+		// observe the original request for one bounded window where an identity may
+		// still arrive. Real SoloMcpClient cancellation rejects it immediately.
+		let graceTimer: ReturnType<typeof setTimeout> | undefined;
+		const late = await Promise.race([
+			spawnRequest.then((result) => ({ result }), () => ({})),
+			new Promise<{}>((resolve) => {
+				graceTimer = setTimeout(() => resolve({}), runtime.cleanupTimeoutMs);
+			}),
+		]);
+		if (graceTimer) clearTimeout(graceTimer);
+		const lateResult = "result" in late ? late.result : undefined;
+		const lateProcessId = lateResult && !soloToolResultIsError(lateResult) ? extractProcessId(lateResult) : undefined;
+		const cancelled = cancellationError(signal);
+		if (lateProcessId != null) {
+			const cleanup = await cleanupSoloProcess(client, lateProcessId, runtime.cleanupTimeoutMs);
+			cancelled.message += `; late spawn returned Solo process #${lateProcessId}; ${cleanup.diagnostic}`;
+		} else {
+			cancelled.message += "; spawn outcome is unknown because no process_id arrived before transport invalidation (orphan risk)";
+		}
+		throw cancelled;
+	}
 	if (soloToolResultIsError(spawnResult)) throw new Error(`spawn_agent failed: ${errorText(spawnResult)}`);
 	const processId = extractProcessId(spawnResult);
 	if (processId == null) throw new Error(`spawn_agent did not return process_id: ${mcpContentToText(spawnResult)}`);
 
-	await waitForReady(client, processId);
-	const prompt = buildSoloTaskPrompt(spec, artifact);
-	await sendInputWithRetry(client, processId, prompt);
+	let cleanupOutcome: CleanupOutcome | undefined;
+	try {
+		throwIfCancelled(signal);
+		await waitForReady(client, processId, signal, runtime);
+		const prompt = buildSoloTaskPrompt(spec, artifact);
+		await sendInputWithRetry(client, processId, prompt, signal, runtime);
 
-	const shouldWait = spec.wait !== false;
-	const completion: ProcessCompletion = shouldWait
-		? await waitForIdle(client, processId, spec.maxWaitMs ?? 30 * 60_000)
-		: { status: "started" };
-	let status = completion.status;
-	const output = shouldWait ? await readProcessOutput(client, processId) : undefined;
-	const artifactContent = shouldWait ? await readScratchpadArtifact(client, artifact) : undefined;
-	if (shouldWait && status === "completed" && !output && !artifactContent) status = "no_output";
-	if (shouldWait && spec.closeOnComplete === true) await closeProcess(client, processId);
-
-	return {
-		id: randomUUID(),
-		name: spec.name,
-		processId,
-		artifactScratchpadName: artifact?.name,
-		artifactScratchpadId: artifact?.id,
-		output: output ? truncate(output, 40_000) : undefined,
-		artifactContent: artifactContent ? truncate(artifactContent, 40_000) : undefined,
-		status,
-		error: completion.error,
-	};
+		const shouldWait = spec.wait !== false;
+		const completion: ProcessCompletion = shouldWait
+			? await waitForIdle(client, processId, spec.maxWaitMs ?? 30 * 60_000, signal, runtime)
+			: { status: "started" };
+		let status = completion.status;
+		throwIfCancelled(signal);
+		const output = shouldWait ? await readProcessOutput(client, processId, signal) : undefined;
+		throwIfCancelled(signal);
+		const artifactContent = shouldWait ? await readScratchpadArtifact(client, artifact, signal) : undefined;
+		throwIfCancelled(signal);
+		if (shouldWait && status === "completed" && !output && !artifactContent) status = "no_output";
+		if (shouldWait && spec.closeOnComplete === true) {
+			cleanupOutcome = await cleanupSoloProcess(client, processId, runtime.cleanupTimeoutMs);
+			throwIfCancelled(signal);
+			if (!cleanupOutcome.cleaned) {
+				return {
+					id: randomUUID(), name: spec.name, processId,
+					artifactScratchpadName: artifact?.name, artifactScratchpadId: artifact?.id,
+					output: output ? truncate(output, 40_000) : undefined,
+					artifactContent: artifactContent ? truncate(artifactContent, 40_000) : undefined,
+					status: "failed", error: `closeOnComplete failed: ${cleanupOutcome.diagnostic}`,
+				};
+			}
+		}
+		throwIfCancelled(signal);
+		return {
+			id: randomUUID(), name: spec.name, processId,
+			artifactScratchpadName: artifact?.name, artifactScratchpadId: artifact?.id,
+			output: output ? truncate(output, 40_000) : undefined,
+			artifactContent: artifactContent ? truncate(artifactContent, 40_000) : undefined,
+			status, error: completion.error,
+		};
+	} catch (error) {
+		cleanupOutcome ??= await cleanupSoloProcess(client, processId, runtime.cleanupTimeoutMs);
+		if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+			const cancelled = signal?.aborted ? cancellationError(signal) : error as Error;
+			cancelled.message = `${cancelled.message}; ${cleanupOutcome.diagnostic}`;
+			throw cancelled;
+		}
+		return {
+			id: randomUUID(), name: spec.name, processId,
+			artifactScratchpadName: artifact?.name, artifactScratchpadId: artifact?.id,
+			status: "failed",
+			error: `${error instanceof Error ? error.message : String(error)}; ${cleanupOutcome.diagnostic}`,
+		};
+	}
 }
 
 export function summarizeSoloTask(result: SpawnedSoloTask): string {
