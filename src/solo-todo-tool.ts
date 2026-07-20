@@ -176,15 +176,15 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 		todos = reconstructTodos(ctx.sessionManager.getBranch());
 	});
 
-	pi.registerTool({
+	pi.registerTool<typeof SoloTermTodoParams, Record<string, unknown>>({
 		name: "solo_todo",
 		label: "SoloTerm Todo",
 		description:
 			"Track SoloTerm workflow tasks. Uses Solo todos when available and Pi session state as a fallback.",
 		promptSnippet: "Track SoloTerm checklist/task progress.",
 		promptGuidelines: ["Use solo_todo when a workflow asks you to create or update checklist/task progress in SoloTerm."],
-		parameters: SoloTermTodoParams as any,
-		async execute(_toolCallId, params: SoloTermTodoArgs) {
+		parameters: SoloTermTodoParams,
+		async execute(_toolCallId, params: SoloTermTodoArgs, _signal: AbortSignal | undefined) {
 			if (!deps.isActive()) throw new Error("SoloTerm mode is not active.");
 
 			const action = String(params.action ?? "list").trim().toLowerCase();
@@ -240,13 +240,15 @@ export function registerSoloTermTodoTool(pi: ExtensionAPI, deps: SoloTermTodoDep
 
 			throw new Error(`Unknown solo_todo action: ${action}`);
 		},
-		renderCall(args: Record<string, unknown>, theme: any) {
+		renderCall(args, theme) {
 			return new Text(`${theme.fg("accent", "☐")} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg("accent", String(args.action ?? "list"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any, context: any) {
-			const count = Array.isArray(result.details?.todos) ? result.details.todos.length : 0;
+		renderResult(result, _opts, theme, context) {
+			const count = Array.isArray(result.details.todos) ? result.details.todos.length : 0;
 			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
-			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg(context.isError ? "error" : "dim", context.isError ? String(result.content?.[0]?.text ?? "solo_todo failed").slice(0, 140) : `${count} todos`)}`, 0, 0);
+			const content = result.content[0];
+			const errorText = content?.type === "text" ? content.text : "solo_todo failed";
+			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_todo"))} ${theme.fg(context.isError ? "error" : "dim", context.isError ? errorText.slice(0, 140) : `${count} todos`)}`, 0, 0);
 		},
 	});
 }

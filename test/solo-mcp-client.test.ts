@@ -57,7 +57,12 @@ test("parseJsonRpcLine parses responses and ignores invalid lines", () => {
 	assert.equal(parseJsonRpcLine(JSON.stringify({ jsonrpc: "1.0", id: 1, result: {} })), undefined);
 	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", method: "note" })), { jsonrpc: "2.0", method: "note" });
 	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { ok: true } })), { jsonrpc: "2.0", id: 7, result: { ok: true } });
-	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", id: 8, error: { code: -1, message: "bad" } })), { jsonrpc: "2.0", id: 8, error: { code: -1, message: "bad" } });
+	assert.deepEqual(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", id: 8, error: { code: -1, message: "bad", data: { retryable: false } } })), {
+		jsonrpc: "2.0",
+		id: 8,
+		error: { code: -1, message: "bad", data: { retryable: false } },
+	});
+	assert.equal(parseJsonRpcLine(JSON.stringify({ jsonrpc: "2.0", id: 9, error: { message: "missing code" } })), undefined);
 });
 
 test("SoloMcpClient handshakes, lists catalog, and calls tools with fake helper", async () => {

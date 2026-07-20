@@ -40,7 +40,7 @@ function unavailable(message: string): never {
 }
 
 export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermScratchpadDeps): void {
-	pi.registerTool({
+	pi.registerTool<typeof SoloTermScratchpadParams, Record<string, unknown>>({
 		name: "solo_scratchpad",
 		label: "SoloTerm Scratchpad",
 		description:
@@ -49,9 +49,9 @@ export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermS
 		promptGuidelines: [
 			"Use solo_scratchpad when a SoloTerm task prompt asks you to save an artifact to a Solo scratchpad.",
 		],
-		parameters: SoloTermScratchpadParams as any,
-		prepareArguments: prepareSoloTermScratchpadArgs as any,
-		async execute(_toolCallId, params: SoloTermScratchpadArgs) {
+		parameters: SoloTermScratchpadParams,
+		prepareArguments: prepareSoloTermScratchpadArgs,
+		async execute(_toolCallId, params: SoloTermScratchpadArgs, _signal: AbortSignal | undefined) {
 			if (!deps.isActive()) return unavailable("SoloTerm mode is not active.");
 			if (!deps.isClientReady()) return unavailable("Solo MCP is not ready or enabled.");
 
@@ -96,12 +96,14 @@ export function registerSoloTermScratchpadTool(pi: ExtensionAPI, deps: SoloTermS
 				return unavailable(`solo_scratchpad failed: ${message}`);
 			}
 		},
-		renderCall(args: Record<string, unknown>, theme: any) {
+		renderCall(args, theme) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_scratchpad"))} ${theme.fg("accent", String(args.action ?? "?"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any, context: any) {
+		renderResult(result, _opts, theme, context) {
 			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
-			const first = String(result.content?.[0]?.text ?? "").split("\n").find((line) => line.trim()) ?? "scratchpad";
+			const content = result.content[0];
+			const text = content?.type === "text" ? content.text : "";
+			const first = text.split("\n").find((line) => line.trim()) ?? "scratchpad";
 			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_scratchpad"))} ${theme.fg(context.isError ? "error" : "dim", first.slice(0, 140))}`, 0, 0);
 		},
 	});

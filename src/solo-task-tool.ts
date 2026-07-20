@@ -118,7 +118,7 @@ function taskSucceeded(result: SpawnedSoloTask): boolean {
 }
 
 export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDeps): void {
-	pi.registerTool({
+	pi.registerTool<typeof SoloTermTaskParams, Record<string, unknown>>({
 		name: "solo_task",
 		label: "SoloTerm Task",
 		description:
@@ -129,8 +129,8 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 			"Use solo_task, not ad-hoc bash or manual panes, when a skill asks to dispatch a SoloTerm subagent.",
 			"Use solo_task with tasks[] for independent parallel investigations requested by skills.",
 		],
-		parameters: SoloTermTaskParams as any,
-		async execute(_toolCallId, params: SoloTermTaskArgs) {
+		parameters: SoloTermTaskParams,
+		async execute(_toolCallId, params: SoloTermTaskArgs, _signal: AbortSignal | undefined) {
 			if (!deps.isActive()) return unavailable("SoloTerm mode is not active. Run /soloterm on or start Pi with --soloterm.");
 			if (!deps.isClientReady()) {
 				return unavailable("Solo MCP is not ready. Make sure Solo is running, MCP is enabled in Solo Settings → MCP, and a Pi agent tool is configured in Solo Settings → Agents.");
@@ -167,7 +167,7 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 				throw new Error(`solo_task failed: ${message}`);
 			}
 		},
-		renderCall(args: Record<string, any>, theme: any) {
+		renderCall(args, theme) {
 			if (Array.isArray(args.tasks) && args.tasks.length > 0) {
 				return new Text(
 					`${theme.fg("accent", "▸")} ${theme.fg("toolTitle", theme.bold("solo_task"))} ${theme.fg("accent", `${args.tasks.length} parallel tasks`)}`,
@@ -183,10 +183,11 @@ export function registerSoloTermTaskTool(pi: ExtensionAPI, deps: SoloTermTaskDep
 				0,
 			);
 		},
-		renderResult(result: any, _opts: any, theme: any, context: any) {
+		renderResult(result, _opts, theme, context) {
 			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
-			const text = result.content?.[0]?.text ?? "";
-			const first = String(text).split("\n").find((line) => line.trim()) ?? "solo_task";
+			const content = result.content[0];
+			const text = content?.type === "text" ? content.text : "";
+			const first = text.split("\n").find((line) => line.trim()) ?? "solo_task";
 			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_task"))} ${theme.fg(context.isError ? "error" : "dim", first.slice(0, 160))}`, 0, 0);
 		},
 	});

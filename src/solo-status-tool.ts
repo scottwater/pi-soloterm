@@ -88,7 +88,7 @@ export function renderSoloStatus(deps: SoloStatusDeps, agentTools?: string, refr
 }
 
 export function registerSoloStatusTool(pi: ExtensionAPI, deps: SoloStatusDeps): void {
-	pi.registerTool({
+	pi.registerTool<typeof SoloStatusParams, Record<string, unknown>>({
 		name: "solo_status",
 		label: "SoloTerm Status",
 		description: "Verify that Pi is running with SoloTerm integration and report Solo MCP availability, identity, and feature support.",
@@ -97,8 +97,8 @@ export function registerSoloStatusTool(pi: ExtensionAPI, deps: SoloStatusDeps): 
 			"Call solo_status before using Solo-backed subagents, todos, scratchpads, or process status.",
 			"If Solo MCP is unavailable, ask the user to run inside SoloTerm and enable Solo MCP instead of improvising manual panes.",
 		],
-		parameters: SoloStatusParams as any,
-		async execute(_toolCallId, params: SoloStatusArgs) {
+		parameters: SoloStatusParams,
+		async execute(_toolCallId, params: SoloStatusArgs, _signal: AbortSignal | undefined) {
 			if (!deps.isActive()) {
 				throw new Error("SoloTerm mode is inactive. Run /soloterm on or start Pi with --soloterm.");
 			}
@@ -109,12 +109,15 @@ export function registerSoloStatusTool(pi: ExtensionAPI, deps: SoloStatusDeps): 
 				throw new Error(`solo_status refresh failed: ${message}`);
 			}
 			const agentTools = await listAgentTools(deps.client);
-			return { content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools) }] };
+			return {
+				content: [{ type: "text" as const, text: renderSoloStatus(deps, agentTools) }],
+				details: { state: deps.client.state, toolCount: deps.client.tools.length },
+			};
 		},
-		renderCall(_args: Record<string, any>, theme: any) {
+		renderCall(_args, theme) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);
 		},
-		renderResult(_result: any, _opts: any, theme: any, context: any) {
+		renderResult(_result, _opts, theme, context) {
 			return new Text(`${theme.fg(context.isError ? "error" : "success", context.isError ? "✘" : "✓")} ${theme.fg("toolTitle", theme.bold("solo_status"))}`, 0, 0);
 		},
 	});

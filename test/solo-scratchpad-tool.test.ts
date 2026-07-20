@@ -27,6 +27,7 @@ test("prepareSoloTermScratchpadArgs accepts Solo-style snake_case aliases", () =
 
 test("scratchpad name resolution reports a missing scratchpad_list helper", async () => {
 	const client: SoloCallToolLike = {
+		tools: [],
 		hasTool: () => false,
 		callTool: async () => { throw new Error("unexpected call"); },
 	};
@@ -35,6 +36,7 @@ test("scratchpad name resolution reports a missing scratchpad_list helper", asyn
 
 test("scratchpad name resolution preserves MCP failure diagnostics", async () => {
 	const client: SoloCallToolLike = {
+		tools: [],
 		hasTool: (name) => name === "scratchpad_list",
 		callTool: async () => ({ isError: true, content: [{ type: "text", text: "Solo scratchpads unavailable" }] }),
 	};
@@ -44,6 +46,7 @@ test("scratchpad name resolution preserves MCP failure diagnostics", async () =>
 test("buildScratchpadWriteArgs writes to an existing scratchpad by id", async () => {
 	const calls: Array<{ name: string; args: any }> = [];
 	const client: SoloCallToolLike = {
+		tools: [],
 		hasTool(name: string) {
 			return ["scratchpad_read", "scratchpad_write"].includes(name);
 		},

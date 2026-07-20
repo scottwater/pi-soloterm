@@ -213,7 +213,7 @@ function summarizeCloseResults(targets: SoloProcessRecord[], results: CloseResul
 }
 
 export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProcessDeps): void {
-	pi.registerTool({
+	pi.registerTool<typeof SoloTermProcessParams, Record<string, unknown>>({
 		name: "solo_process",
 		label: "SoloTerm Process",
 		description:
@@ -224,8 +224,8 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 			"Use action=close_subagents to close Pi-spawned SoloTerm child agents; it excludes the current process and defaults to --soloterm child panes only.",
 			"Call solo_status first if SoloTerm/MCP readiness has not already been checked.",
 		],
-		parameters: SoloTermProcessParams as any,
-		async execute(_toolCallId, params: SoloTermProcessArgs) {
+		parameters: SoloTermProcessParams,
+		async execute(_toolCallId, params: SoloTermProcessArgs, _signal: AbortSignal | undefined) {
 			if (!deps.isActive()) return unavailable("SoloTerm mode is not active. Run /soloterm on or start Pi with --soloterm.");
 			if (!deps.isClientReady()) return unavailable("Solo MCP is not ready or enabled.");
 
@@ -328,12 +328,14 @@ export function registerSoloTermProcessTool(pi: ExtensionAPI, deps: SoloTermProc
 				return unavailable(`solo_process failed: ${message}`);
 			}
 		},
-		renderCall(args: Record<string, unknown>, theme: any) {
+		renderCall(args, theme) {
 			return new Text(`${theme.fg("accent", "◫")} ${theme.fg("toolTitle", theme.bold("solo_process"))} ${theme.fg("accent", String(args.action ?? "list"))}`, 0, 0);
 		},
-		renderResult(result: any, _opts: any, theme: any, context: any) {
+		renderResult(result, _opts, theme, context) {
 			const icon = context.isError ? theme.fg("error", "✘") : theme.fg("success", "✓");
-			const first = String(result.content?.[0]?.text ?? "").split("\n").find((line) => line.trim()) ?? "solo_process";
+			const content = result.content[0];
+			const text = content?.type === "text" ? content.text : "";
+			const first = text.split("\n").find((line) => line.trim()) ?? "solo_process";
 			return new Text(`${icon} ${theme.fg("toolTitle", theme.bold("solo_process"))} ${theme.fg(context.isError ? "error" : "dim", first.slice(0, 160))}`, 0, 0);
 		},
 	});

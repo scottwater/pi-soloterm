@@ -6,6 +6,9 @@
     "strict": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
+    // Pi 0.80.6's shrinkwrapped provider declarations contain unresolved optional-import probes.
+    // Project and test sources remain fully strict; only third-party declaration internals are skipped.
+    "skipLibCheck": true,
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]

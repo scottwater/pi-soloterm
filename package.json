@@ -14,8 +14,10 @@
   "license": "MIT",
   "author": "Scott Watermasysk",
   "scripts": {
-    "test": "node --test test/*.test.ts",
-    "pack:dry-run": "npm pack --dry-run"
+    "test": "npm run typecheck && npm run test:unit",
+    "pack:dry-run": "npm pack --dry-run",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --test test/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -23,9 +25,12 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@earendil-works/pi-tui": "^0.74.0",
-    "typebox": "^1.0.56"
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "typebox": "^1.0.56",
+    "typescript": "5.9.3"
   },
   "packageManager": "npm@11.14.1",
   "pi": {

@@ -9,7 +9,7 @@
  * JSON-RPC/MCP over its stdio streams.
  */
 
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -87,7 +87,7 @@ export interface SoloMcpTransport {
 	stdin: Writable;
 	stdout: Readable;
 	stderr: Readable;
-	kill(signal?: NodeJS.Signals | string): boolean | void;
+	kill(signal?: NodeJS.Signals | number): boolean | void;
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
 	on(event: "error", listener: (error: Error) => void): this;
 }
@@ -133,8 +133,18 @@ export function parseJsonRpcLine(line: string): JsonRpcMessage | undefined {
 	const record = value as Record<string, unknown>;
 	if (record.jsonrpc !== "2.0") return undefined;
 	if (typeof record.method === "string" && record.id === undefined) return record as unknown as JsonRpcNotification;
-	if (typeof record.id === "number" && ("result" in record || "error" in record)) {
-		return record as JsonRpcResponse;
+	if (typeof record.id === "number" && "result" in record) {
+		return { jsonrpc: "2.0", id: record.id, result: record.result };
+	}
+	if (typeof record.id === "number" && record.error && typeof record.error === "object") {
+		const error = record.error as Record<string, unknown>;
+		if (typeof error.code === "number" && typeof error.message === "string") {
+			return {
+				jsonrpc: "2.0",
+				id: record.id,
+				error: { code: error.code, message: error.message, ...(error.data === undefined ? {} : { data: error.data }) },
+			};
+		}
 	}
 	return undefined;
 }
@@ -188,7 +198,7 @@ export function soloToolResultIsError(result: McpToolCallResult): boolean {
 }
 
 function defaultSpawn(command: string, args: string[], options: Parameters<SoloMcpSpawn>[2]): SoloMcpTransport {
-	return spawn(command, args, options) as ChildProcessByStdio<Writable, Readable, Readable>;
+	return spawn(command, args, options);
 }
 
 export class SoloMcpClient implements SoloCallToolLike {
@@ -344,16 +354,18 @@ export class SoloMcpClient implements SoloCallToolLike {
 					if (!this.stopped) this.failState(error instanceof Error ? error.message : String(error));
 				}
 				throw error;
-			} finally {
-				if (this.ensurePromise === ensurePromise) this.ensurePromise = undefined;
 			}
 		})();
 		this.ensurePromise = ensurePromise;
-		return ensurePromise;
+		try {
+			await ensurePromise;
+		} finally {
+			if (this.ensurePromise === ensurePromise) this.ensurePromise = undefined;
+		}
 	}
 
 	private spawnChild(): void {
-		const env = { ...process.env, SOLOTERM_APP_DATA_DIR: this.appDataDir };
+		const env: NodeJS.ProcessEnv = { ...process.env, SOLOTERM_APP_DATA_DIR: this.appDataDir };
 		if (this.soloProcessId) env.SOLO_PROCESS_ID = this.soloProcessId;
 
 		const child = this.spawnTransport(this.helperPath, [], { stdio: ["pipe", "pipe", "pipe"], env });
