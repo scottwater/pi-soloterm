@@ -1,6 +1,6 @@
 {
   "name": "pi-solo-term-tools",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "description": "Optional Pi extension that exposes a focused SoloTerm MCP surface as native Pi tools.",
   "keywords": [
